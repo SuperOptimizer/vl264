@@ -495,7 +495,9 @@ static const uint8_t zigzag4x4[16] = {
 VL264_INTERNAL void quant4x4(int16_t coeff[16], int32_t qp, bool is_intra) {
     int32_t qp_rem = qp % 6;
     int32_t qp_div = qp / 6;
-    int32_t f = is_intra ? (1 << (15 + qp_div)) / 3 : (1 << (15 + qp_div)) / 6;
+    // Wider dead zone for inter blocks: /4 instead of /6 produces more zeros
+    // (standard H.264 uses /3 intra, /6 inter; we use /3 intra, /4 inter)
+    int32_t f = is_intra ? (1 << (15 + qp_div)) / 3 : (1 << (15 + qp_div)) / 4;
 
     for (int i = 0; i < 16; i++) {
         int32_t mf = quant_mf[qp_rem][mf_idx[i]];
@@ -1082,13 +1084,19 @@ VL264_INTERNAL int32_t select_best_axis(const uint8_t* data) {
 VL264_INTERNAL void extract_slice(const uint8_t* VL264_RESTRICT vol,
                                    int32_t axis, int32_t idx,
                                    int16_t* VL264_RESTRICT out) {
+    if (axis == 2) {
+        // Z-axis: rows are contiguous in memory — fast path
+        const uint8_t* src = vol + idx * DIM * DIM;
+        for (int32_t i = 0; i < DIM * DIM; i++)
+            out[i] = (int16_t)src[i];
+        return;
+    }
     for (int32_t a = 0; a < DIM; a++) {
         for (int32_t b = 0; b < DIM; b++) {
             int32_t vi;
             switch (axis) {
             case 0: vi = a * DIM * DIM + b * DIM + idx; break;
-            case 1: vi = a * DIM * DIM + idx * DIM + b; break;
-            default: vi = idx * DIM * DIM + a * DIM + b; break;
+            default: vi = a * DIM * DIM + idx * DIM + b; break;
             }
             out[a * DIM + b] = (int16_t)vol[vi];
         }
@@ -1368,7 +1376,8 @@ struct vl264_enc {
     VL264_ALIGNED(64) int16_t boundary_buf[DIM * DIM];
 
     int16_t nc_map[BSTRIDE * BSTRIDE];
-    int16_t dc_map[BSTRIDE * BSTRIDE]; // DC values of reconstructed blocks for DC prediction
+    int16_t dc_map[BSTRIDE * BSTRIDE];
+    vl264_mv mv_map[BSTRIDE * BSTRIDE]; // MVs for MV prediction
 
     uint32_t slice_order[DIM];
 };
@@ -1425,12 +1434,12 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
         }
         bs->mb_type = MB_TYPE_I4x4;
     } else {
-        // P-frame: zero-MV first. Only use ME if it produces fewer non-zero coefficients.
+        // P-frame: zero-MV first. Only search if zero-MV produces many non-zero coefficients.
         get_block(ref_slice, bx*4, by*4, bs->pred);
         bs->mv = (vl264_mv){0, 0};
         bs->mb_type = MB_TYPE_P;
 
-        // Compute zero-MV residual + quant to check if skip is possible
+        // Quick zero-MV check: compute residual, DCT, quant
         int16_t zres[16], zcoeff[16];
         for (int i = 0; i < 16; i++) zres[i] = (int16_t)(orig[i] - bs->pred[i]);
         dct4x4_fwd(zres, zcoeff);
@@ -1438,8 +1447,9 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
         int32_t znz = 0;
         for (int i = 0; i < 16; i++) if (zcoeff[i] != 0) znz++;
 
-        if (znz > 0) {
-            // Zero-MV has residual. Try ME search for better prediction.
+        // Conditional ME: only search if zero-MV has many non-zero coefficients.
+        // For 0-2 non-zero coefficients, the ME search rarely finds anything better.
+        if (znz > 2) {
             int32_t best_sad = sad_4x4(orig, bs->pred);
             if (best_sad > 16) {
                 int32_t me_sad;
@@ -1450,22 +1460,9 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
                 if (me_sad < best_sad) {
                     bs->mv = me_mv;
                     mc_block(ref_slice, bx*4, by*4, bs->mv, bs->pred);
-                    best_sad = me_sad;
-                }
-            }
-            // Check intra DC (DEFAULT+ only)
-            if (e->cfg.quality >= VL264_DEFAULT && best_sad > 32) {
-                int16_t ip[16], top[4], left[4], tl;
-                get_neighbors(recon_slice, bx, by, top, left, &tl);
-                intra_pred_4x4(ip, INTRA_DC, top, left, tl);
-                if (sad_4x4(orig, ip) < best_sad) {
-                    memcpy(bs->pred, ip, 32);
-                    bs->mode = INTRA_DC; bs->mb_type = MB_TYPE_I4x4;
-                    bs->mv = (vl264_mv){0,0};
                 }
             }
         }
-        // else: zero-MV produces zero coefficients → will be skip (handled below)
     }
 
     // Residual, DCT, quant
@@ -1539,6 +1536,22 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
     return bs->total_coeff;
 }
 
+// MV prediction: median of left and above neighbors
+VL264_INTERNAL vl264_mv predict_mv(const vl264_mv* mv_map, int32_t bx, int32_t by) {
+    vl264_mv pred = {0, 0};
+    if (bx > 0 && by > 0) {
+        vl264_mv l = mv_map[by * BSTRIDE + bx - 1];
+        vl264_mv t = mv_map[(by-1) * BSTRIDE + bx];
+        pred.x = (int16_t)((l.x + t.x + 1) >> 1);
+        pred.y = (int16_t)((l.y + t.y + 1) >> 1);
+    } else if (bx > 0) {
+        pred = mv_map[by * BSTRIDE + bx - 1];
+    } else if (by > 0) {
+        pred = mv_map[(by-1) * BSTRIDE + bx];
+    }
+    return pred;
+}
+
 // DC prediction: predict current block's DC from left/above reconstructed DC
 VL264_INTERNAL int16_t predict_dc(const int16_t* dc_map, int32_t bx, int32_t by) {
     bool has_left = bx > 0;
@@ -1568,12 +1581,15 @@ VL264_INTERNAL void write_coded_block(vl264_enc* e, bs_writer* w,
         }
     } else {
         bs_w_bit1(w, 1); // inter
-        if (bs->mv.x == 0 && bs->mv.y == 0) {
-            bs_w_bit1(w, 0); // zero MV (1 bit)
+        vl264_mv mvp = predict_mv(e->mv_map, bx, by);
+        int16_t mvdx = (int16_t)(bs->mv.x - mvp.x);
+        int16_t mvdy = (int16_t)(bs->mv.y - mvp.y);
+        if (mvdx == 0 && mvdy == 0) {
+            bs_w_bit1(w, 0); // predicted MV (1 bit)
         } else {
-            bs_w_bit1(w, 1); // non-zero MV
-            bs_w_se(w, bs->mv.x);
-            bs_w_se(w, bs->mv.y);
+            bs_w_bit1(w, 1); // has MV delta
+            bs_w_se(w, mvdx);
+            bs_w_se(w, mvdy);
         }
     }
 
@@ -1605,6 +1621,7 @@ VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
                                   int32_t qp_base) {
     memset(e->nc_map, 0, sizeof(e->nc_map));
     memset(e->dc_map, 0, sizeof(e->dc_map));
+    memset(e->mv_map, 0, sizeof(e->mv_map));
 
     if (!is_iframe && ref) {
         memcpy(recon, ref, DIM * DIM * sizeof(int16_t));
@@ -1662,6 +1679,7 @@ VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
                 bs_w_ue(w, (uint32_t)skip_run);
                 skip_run = 0;
                 write_coded_block(e, w, &bs, bx, by);
+                e->mv_map[by * BSTRIDE + bx] = bs.mv;
                 e->nc_map[by * BSTRIDE + bx] = (int16_t)(tc > 0 ? tc : 1);
                 e->stats.total_blocks++;
                 e->stats.avg_nonzero_coeffs += (float)VL264_MAX(tc, 0);
@@ -1901,7 +1919,8 @@ struct vl264_dec {
     int16_t* lod_upsampled;
 
     int16_t nc_map[BSTRIDE * BSTRIDE];
-    int16_t dc_map[BSTRIDE * BSTRIDE]; // DC values for DC prediction (mirrors encoder)
+    int16_t dc_map[BSTRIDE * BSTRIDE];
+    vl264_mv mv_map[BSTRIDE * BSTRIDE];
     uint32_t slice_order[DIM];
 
     // Streaming state
@@ -1936,11 +1955,14 @@ VL264_INTERNAL void decode_block(vl264_dec* d, bs_reader* r,
             if (mode >= INTRA_NUM_MODES) mode = INTRA_DC;
         }
     } else {
-        if (bs_r_bit1(r)) { // has non-zero MV
-            mv.x = (int16_t)bs_r_se(r);
-            mv.y = (int16_t)bs_r_se(r);
+        vl264_mv mvp = predict_mv(d->mv_map, bx, by);
+        if (bs_r_bit1(r)) { // has MV delta
+            mv.x = (int16_t)(mvp.x + bs_r_se(r));
+            mv.y = (int16_t)(mvp.y + bs_r_se(r));
+        } else {
+            mv = mvp; // predicted MV
         }
-        // else: mv stays {0,0}
+        d->mv_map[by * BSTRIDE + bx] = mv;
     }
 
     // Decode coefficients
@@ -1993,6 +2015,7 @@ VL264_INTERNAL void decode_slice_blocks(vl264_dec* d, bs_reader* r,
                                          int32_t qp, bool is_iframe) {
     memset(d->nc_map, 0, sizeof(d->nc_map));
     memset(d->dc_map, 0, sizeof(d->dc_map));
+    memset(d->mv_map, 0, sizeof(d->mv_map));
 
     if (!is_iframe && ref) {
         memcpy(recon, ref, DIM * DIM * sizeof(int16_t));
