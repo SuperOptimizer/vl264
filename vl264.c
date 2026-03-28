@@ -1328,6 +1328,27 @@ VL264_INTERNAL int32_t detect_bit_shift(const uint8_t* data) {
     return 0;
 }
 
+// 3x3 box filter for reference frame smoothing.
+// Reduces noise in the prediction reference, making residuals smaller.
+VL264_INTERNAL void smooth_slice(const int16_t* VL264_RESTRICT in,
+                                  int16_t* VL264_RESTRICT out) {
+    for (int32_t y = 0; y < DIM; y++) {
+        for (int32_t x = 0; x < DIM; x++) {
+            int32_t sum = 0, count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int32_t ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < DIM && nx >= 0 && nx < DIM) {
+                        sum += in[ny * DIM + nx];
+                        count++;
+                    }
+                }
+            }
+            out[y * DIM + x] = (int16_t)(sum / count);
+        }
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 18: Encoder state + core
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1339,6 +1360,7 @@ struct vl264_enc {
 
     VL264_ALIGNED(64) int16_t cur_slice[DIM * DIM];
     VL264_ALIGNED(64) int16_t ref_slice[DIM * DIM];
+    VL264_ALIGNED(64) int16_t ref_smooth[DIM * DIM]; // smoothed reference for inter pred
     VL264_ALIGNED(64) int16_t recon_slice[DIM * DIM];
 
     int16_t* lod_upsampled;
