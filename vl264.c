@@ -916,9 +916,10 @@ VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], in
         return;
     }
 
-    if (total_coeff == 1 && last_sig == 0) {
-        // DC-only: very common at high QP
+    if (total_coeff == 1) {
+        // Single coefficient: header "01" + ue(position) + se(level)
         bs_w_bits(w, 1, 2); // 01
+        bs_w_ue(w, (uint32_t)last_sig);
         bs_w_se(w, levels[0]);
         return;
     }
@@ -931,10 +932,10 @@ VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], in
         return;
     }
 
-    // Sparse: most general case
+    // Sparse (2-11 coefficients): header "10" + count + last_sig + sig_map + levels
     bs_w_bits(w, 2, 2); // 10
-    bs_w_ue(w, (uint32_t)(total_coeff - 1)); // -1 since we know it's >= 1, saves 1 bit on average
-    bs_w_bits(w, (uint32_t)last_sig, 4); // 4 bits for position 0-15 (fixed, more compact than ue for mid values)
+    bs_w_ue(w, (uint32_t)(total_coeff - 2)); // -2 since we know it's >= 2
+    bs_w_ue(w, (uint32_t)last_sig); // ue is cheaper than 4 fixed bits for small positions
 
     for (int i = 0; i < last_sig; i++)
         bs_w_bit1(w, sig_map[i]);
@@ -952,8 +953,10 @@ VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t 
     if (hdr == 0) return; // all zero
 
     if (hdr == 1) {
-        // DC-only
-        coeff[zigzag4x4[0]] = (int16_t)bs_r_se(r);
+        // Single coefficient at any position
+        uint32_t pos = bs_r_ue(r);
+        if (pos > 15) pos = 15;
+        coeff[zigzag4x4[pos]] = (int16_t)bs_r_se(r);
         return;
     }
 
@@ -964,11 +967,11 @@ VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t 
         return;
     }
 
-    // Sparse (hdr == 2)
-    uint32_t total_coeff = bs_r_ue(r) + 1;
+    // Sparse (hdr == 2): 2-11 coefficients
+    uint32_t total_coeff = bs_r_ue(r) + 2;
     if (total_coeff > 16) total_coeff = 16;
 
-    uint32_t last_sig = bs_r_bits(r, 4);
+    uint32_t last_sig = bs_r_ue(r);
     if (last_sig > 15) last_sig = 15;
 
     uint8_t sig_map[16] = {0};
@@ -1485,8 +1488,13 @@ VL264_INTERNAL void write_coded_block(vl264_enc* e, bs_writer* w,
         }
     } else {
         bs_w_bit1(w, 1); // inter
-        bs_w_se(w, bs->mv.x);
-        bs_w_se(w, bs->mv.y);
+        if (bs->mv.x == 0 && bs->mv.y == 0) {
+            bs_w_bit1(w, 0); // zero MV (1 bit)
+        } else {
+            bs_w_bit1(w, 1); // non-zero MV
+            bs_w_se(w, bs->mv.x);
+            bs_w_se(w, bs->mv.y);
+        }
     }
 
     // Apply DC prediction before writing coefficients
@@ -1503,10 +1511,11 @@ VL264_INTERNAL void write_coded_block(vl264_enc* e, bs_writer* w,
 }
 
 // Early skip threshold: if SAD < threshold, skip without DCT/quant.
-// Threshold scales with QP (higher QP = more aggressive skip).
+// Conservative at low QP, aggressive at high QP.
 VL264_INTERNAL int32_t early_skip_threshold(int32_t qp) {
-    // Approximate: at QP=20, threshold ~32; at QP=40, threshold ~256
-    return 16 + (qp * qp / 8);
+    if (qp <= 15) return 8;      // very conservative at low QP
+    if (qp <= 25) return 16 + (qp - 15) * 3; // ramp up: 16-46
+    return 46 + (qp - 25) * 8;   // aggressive at high QP: 46-254
 }
 
 // Encode a full 128x128 slice with skip-run encoding and DC prediction.
@@ -1810,17 +1819,19 @@ VL264_INTERNAL void decode_block(vl264_dec* d, bs_reader* r,
     vl264_mv mv = {0, 0};
 
     if (!is_inter) {
-        // Compact mode: DC="0", other="1"+3-bit index
         if (bs_r_bit1(r) == 0) {
             mode = INTRA_DC;
         } else {
             int32_t idx = (int32_t)bs_r_bits(r, 3);
-            mode = idx < INTRA_DC ? idx : idx + 1; // re-insert DC gap
+            mode = idx < INTRA_DC ? idx : idx + 1;
             if (mode >= INTRA_NUM_MODES) mode = INTRA_DC;
         }
     } else {
-        mv.x = (int16_t)bs_r_se(r);
-        mv.y = (int16_t)bs_r_se(r);
+        if (bs_r_bit1(r)) { // has non-zero MV
+            mv.x = (int16_t)bs_r_se(r);
+            mv.y = (int16_t)bs_r_se(r);
+        }
+        // else: mv stays {0,0}
     }
 
     // Decode coefficients
