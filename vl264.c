@@ -295,6 +295,7 @@ typedef struct {
     uint8_t  morton;        // 0=raster, 1=morton
     uint8_t  has_boundary;  // boundary prediction flag
     uint8_t  has_lod;       // LOD delta coding flag
+    uint8_t  bit_shift;     // right-shift applied before encoding (0-5)
 } vl264_sps_data;
 
 // VL264 slice header
@@ -311,6 +312,7 @@ VL264_INTERNAL void write_sps(bs_writer* w, const vl264_sps_data* sps) {
     bs_w_bit1(w, sps->morton);
     bs_w_bit1(w, sps->has_boundary);
     bs_w_bit1(w, sps->has_lod);
+    bs_w_bits(w, sps->bit_shift, 3); // 0-5 shift amount
     bs_w_align(w);
 }
 
@@ -320,6 +322,7 @@ VL264_INTERNAL void read_sps(bs_reader* r, vl264_sps_data* sps) {
     sps->morton = (uint8_t)bs_r_bit1(r);
     sps->has_boundary = (uint8_t)bs_r_bit1(r);
     sps->has_lod = (uint8_t)bs_r_bit1(r);
+    sps->bit_shift = (uint8_t)bs_r_bits(r, 3);
     bs_r_align(r);
 }
 
@@ -1270,6 +1273,28 @@ VL264_INTERNAL uint32_t variance_block(const int16_t* slice, int32_t px, int32_t
     return (uint32_t)(sum2 / count - mean * mean);
 }
 
+// Detect effective bit depth by finding GCD of a sample of non-zero values.
+// Returns the right-shift amount (0-5). 0 = full 8-bit, 3 = 5 significant bits, etc.
+VL264_INTERNAL int32_t detect_bit_shift(const uint8_t* data) {
+    // Check if ALL values have their low N bits zeroed.
+    // This is stricter than GCD — ensures lossless round-trip for the shift.
+    uint8_t low_bits_or = 0;
+    for (size_t i = 0; i < VL264_CHUNK_VOXELS; i += 64)
+        low_bits_or |= data[i];
+    // Find how many trailing zero bits are common to all values
+    if (low_bits_or & 1) return 0;   // at least one odd value
+    if (low_bits_or & 2) return 1;   // bit 1 is set somewhere
+    if (low_bits_or & 4) return 2;   // bit 2 is set somewhere
+    // Check full volume (not just sample) for shift >= 3
+    low_bits_or = 0;
+    for (size_t i = 0; i < VL264_CHUNK_VOXELS; i++)
+        low_bits_or |= data[i];
+    if ((low_bits_or & 0x07) == 0) return 3; // low 3 bits all zero everywhere
+    if ((low_bits_or & 0x03) == 0) return 2;
+    if ((low_bits_or & 0x01) == 0) return 1;
+    return 0;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 18: Encoder state + core
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1624,7 +1649,25 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
     else
         axis = (int32_t)e->cfg.axis;
 
-    // 2. Set QP (user's QP respected directly)
+    // 2. Detect and apply bit-depth shift
+    int32_t bit_shift = 0;
+    if (e->cfg.bit_depth > 0 && e->cfg.bit_depth < 8) {
+        bit_shift = 8 - e->cfg.bit_depth;
+    } else if (e->cfg.bit_depth == 0) {
+        bit_shift = detect_bit_shift(input);
+    }
+    // Apply right-shift to input (use a stack copy for small shifts, heap for safety)
+    uint8_t* shifted_input = NULL;
+    const uint8_t* enc_input = input;
+    if (bit_shift > 0) {
+        shifted_input = (uint8_t*)malloc(VL264_CHUNK_VOXELS);
+        if (!shifted_input) return VL264_ERR_ALLOC;
+        for (size_t i = 0; i < VL264_CHUNK_VOXELS; i++)
+            shifted_input[i] = input[i] >> bit_shift;
+        enc_input = shifted_input;
+    }
+
+    // 3. Set QP (user's QP respected directly)
     int32_t qp_base = e->cfg.qp;
     if (qp_base == 0) {
         switch (e->cfg.quality) {
@@ -1674,6 +1717,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
         .morton = e->cfg.morton_order ? 1 : 0,
         .has_boundary = (neighbors != NULL) && e->cfg.boundary_pred ? 1 : 0,
         .has_lod = use_lod ? 1 : 0,
+        .bit_shift = (uint8_t)bit_shift,
     };
     write_sps(&w, &sps);
     bs_w_nal_end(&w, sps_off);
@@ -1696,7 +1740,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
 
         // Extract slice
         VL264_ALIGNED(64) int16_t cur[DIM * DIM];
-        extract_slice(input, axis, (int32_t)spatial_idx, cur);
+        extract_slice(enc_input, axis, (int32_t)spatial_idx, cur);
 
         // LOD delta: subtract upsampled prediction
         if (use_lod) {
@@ -1771,6 +1815,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
     if (e->stats.total_blocks > 0)
         e->stats.avg_nonzero_coeffs /= (float)e->stats.total_blocks;
 
+    free(shifted_input);
     return VL264_OK;
 }
 
@@ -2034,6 +2079,12 @@ VL264_INTERNAL vl264_status decode_chunk_impl(vl264_dec* d,
         slice_ci++;
     }
 
+    // Apply left-shift to restore original bit depth
+    if (d->sps.bit_shift > 0) {
+        for (size_t i = 0; i < VL264_CHUNK_VOXELS; i++)
+            chunk_out[i] = (uint8_t)(chunk_out[i] << d->sps.bit_shift);
+    }
+
     return VL264_OK;
 }
 
@@ -2069,6 +2120,7 @@ vl264_cfg vl264_default_cfg(void) {
         .morton_order    = false,
         .iframe_interval = 0, // auto from quality
         .max_error       = 0, // unlimited
+        .bit_depth       = 0, // auto-detect
     };
 }
 

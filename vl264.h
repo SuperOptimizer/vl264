@@ -67,6 +67,7 @@ typedef struct vl264_cfg {
     bool          morton_order;  // space-filling curve slice ordering
     int32_t       iframe_interval; // I-frame every N slices (0 = auto from quality)
     int32_t       max_error;     // max allowed per-voxel error (0 = unlimited)
+    int32_t       bit_depth;     // significant bits (0=auto-detect, 4-8=explicit)
 } vl264_cfg;
 
 // Returns a default configuration (VL264_DEFAULT quality).
