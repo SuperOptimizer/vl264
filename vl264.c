@@ -890,6 +890,43 @@ VL264_INTERNAL vl264_mv me_refine_qpel(const int16_t orig[16], const int16_t* re
 // Section 9 & 10: CAVLC entropy coding + lookup tables
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Rice (Golomb-Rice) coding for signed coefficient levels.
+// Unary prefix for quotient, k-bit suffix for remainder, sign bit.
+// Escape: if quotient > 12, write 12 zeros + stop + ue(quotient-12) instead.
+VL264_INTERNAL void rice_encode(bs_writer* w, int32_t val, int32_t k) {
+    uint32_t absval = (uint32_t)abs(val);
+    uint32_t q = absval >> k;
+    uint32_t rem = absval & (shl32(1u, k) - 1);
+    if (q < 12) {
+        // Normal: q zeros + stop bit
+        for (uint32_t i = 0; i < q; i++) bs_w_bit1(w, 0);
+        bs_w_bit1(w, 1);
+    } else {
+        // Escape: 12 zeros (no stop) + ue(quotient)
+        for (int i = 0; i < 12; i++) bs_w_bit1(w, 0);
+        bs_w_ue(w, q);
+    }
+    if (k > 0) bs_w_bits(w, rem, k);
+    if (absval > 0) bs_w_bit1(w, val < 0 ? 1 : 0);
+}
+
+VL264_INTERNAL int32_t rice_decode(bs_reader* r, int32_t k) {
+    uint32_t q = 0;
+    for (;;) {
+        if (bs_r_bit1(r)) break; // stop bit → normal path (q < 12)
+        q++;
+        if (q >= 12) {
+            q = bs_r_ue(r); // escape: read full quotient via ue
+            break;
+        }
+    }
+    uint32_t rem = (k > 0) ? bs_r_bits(r, k) : 0;
+    uint32_t absval = (q << k) + rem;
+    if (absval == 0) return 0;
+    int32_t sign = bs_r_bit1(r) ? -1 : 1;
+    return sign * (int32_t)absval;
+}
+
 // Compact coefficient coding.
 // 3 modes signaled by 2-bit header:
 //   00 = all zero (1 bit total with the leading 0)
@@ -920,31 +957,29 @@ VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], in
     }
 
     if (total_coeff == 1) {
-        // Single coefficient: header "01" + ue(position) + se(level)
         bs_w_bits(w, 1, 2); // 01
         bs_w_ue(w, (uint32_t)last_sig);
-        bs_w_se(w, levels[0]);
+        rice_encode(w, levels[0], 0);
         return;
     }
 
     if (total_coeff >= 12) {
-        // Dense: write all 16 coefficients
         bs_w_bits(w, 3, 2); // 11
         for (int i = 0; i < 16; i++)
-            bs_w_se(w, coeff[zigzag4x4[i]]);
+            rice_encode(w, coeff[zigzag4x4[i]], 1); // k=1 for dense
         return;
     }
 
-    // Sparse (2-11 coefficients): header "10" + count + last_sig + sig_map + levels
+    // Sparse (2-11 coefficients)
     bs_w_bits(w, 2, 2); // 10
-    bs_w_ue(w, (uint32_t)(total_coeff - 2)); // -2 since we know it's >= 2
-    bs_w_ue(w, (uint32_t)last_sig); // ue is cheaper than 4 fixed bits for small positions
+    bs_w_ue(w, (uint32_t)(total_coeff - 2));
+    bs_w_ue(w, (uint32_t)last_sig);
 
     for (int i = 0; i < last_sig; i++)
         bs_w_bit1(w, sig_map[i]);
 
     for (int i = total_coeff - 1; i >= 0; i--)
-        bs_w_se(w, levels[i]);
+        rice_encode(w, levels[i], 0); // k=0 for sparse
 }
 
 VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t nc) {
@@ -956,21 +991,19 @@ VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t 
     if (hdr == 0) return; // all zero
 
     if (hdr == 1) {
-        // Single coefficient at any position
         uint32_t pos = bs_r_ue(r);
         if (pos > 15) pos = 15;
-        coeff[zigzag4x4[pos]] = (int16_t)bs_r_se(r);
+        coeff[zigzag4x4[pos]] = (int16_t)rice_decode(r, 0);
         return;
     }
 
     if (hdr == 3) {
-        // Dense: read all 16
         for (int i = 0; i < 16; i++)
-            coeff[zigzag4x4[i]] = (int16_t)bs_r_se(r);
+            coeff[zigzag4x4[i]] = (int16_t)rice_decode(r, 1); // k=1 for dense
         return;
     }
 
-    // Sparse (hdr == 2): 2-11 coefficients
+    // Sparse (hdr == 2)
     uint32_t total_coeff = bs_r_ue(r) + 2;
     if (total_coeff > 16) total_coeff = 16;
 
@@ -984,7 +1017,7 @@ VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t 
 
     int16_t levels[16];
     for (int i = (int)total_coeff - 1; i >= 0; i--)
-        levels[i] = (int16_t)bs_r_se(r);
+        levels[i] = (int16_t)rice_decode(r, 0); // k=0 for sparse
 
     int32_t li = 0;
     for (uint32_t i = 0; i <= last_sig && li < (int32_t)total_coeff; i++) {
