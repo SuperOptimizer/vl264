@@ -65,6 +65,8 @@ typedef struct vl264_cfg {
     bool          boundary_pred; // inter-chunk boundary prediction
     bool          lod_delta;     // encode as residual vs upsampled coarser LOD
     bool          morton_order;  // space-filling curve slice ordering
+    int32_t       iframe_interval; // I-frame every N slices (0 = auto from quality)
+    int32_t       max_error;     // max allowed per-voxel error (0 = unlimited)
 } vl264_cfg;
 
 // Returns a default configuration (VL264_DEFAULT quality).

@@ -1274,17 +1274,18 @@ VL264_INTERNAL uint32_t variance_block(const int16_t* slice, int32_t px, int32_t
 struct vl264_enc {
     vl264_cfg        cfg;
     vl264_enc_stats  stats;
-    int32_t          resolved_qp; // base QP after auto/classification adjustment
+    int32_t          resolved_qp;
 
     VL264_ALIGNED(64) int16_t cur_slice[DIM * DIM];
     VL264_ALIGNED(64) int16_t ref_slice[DIM * DIM];
     VL264_ALIGNED(64) int16_t recon_slice[DIM * DIM];
 
-    int16_t* lod_upsampled; // DIM^3 i16 (heap, only if lod_delta)
+    int16_t* lod_upsampled;
 
     VL264_ALIGNED(64) int16_t boundary_buf[DIM * DIM];
 
-    int16_t nc_map[BSTRIDE * BSTRIDE]; // nC per block for current slice
+    int16_t nc_map[BSTRIDE * BSTRIDE];
+    int16_t dc_map[BSTRIDE * BSTRIDE]; // DC values of reconstructed blocks for DC prediction
 
     uint32_t slice_order[DIM];
 };
@@ -1424,7 +1425,49 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
             recon_slice[(by*4+dy)*DIM + bx*4+dx] = (int16_t)VL264_CLAMP(v, 0, 255);
         }
 
+    // Max error clamping: if any pixel exceeds max_error, re-encode with QP=1
+    if (e->cfg.max_error > 0) {
+        int32_t max_err = 0;
+        for (int dy = 0; dy < 4; dy++)
+            for (int dx = 0; dx < 4; dx++) {
+                int32_t err = abs(orig[dy*4+dx] - recon_slice[(by*4+dy)*DIM + bx*4+dx]);
+                if (err > max_err) max_err = err;
+            }
+        if (max_err > e->cfg.max_error && qp > 4) {
+            // Re-encode with lower QP to bring error within bounds
+            int32_t retry_qp = VL264_MAX(qp / 2, 1);
+            for (int i = 0; i < 16; i++) residual[i] = (int16_t)(orig[i] - bs->pred[i]);
+            dct4x4_fwd(residual, bs->coeff);
+            quant4x4(bs->coeff, retry_qp, bs->mb_type == MB_TYPE_I4x4);
+            bs->total_coeff = 0;
+            for (int i = 0; i < 16; i++) if (bs->coeff[i] != 0) bs->total_coeff++;
+            // Re-reconstruct
+            memcpy(dq, bs->coeff, sizeof(dq));
+            dequant4x4(dq, retry_qp);
+            dct4x4_inv(dq, recon_res);
+            for (int dy = 0; dy < 4; dy++)
+                for (int dx = 0; dx < 4; dx++) {
+                    int32_t v2 = bs->pred[dy*4+dx] + recon_res[dy*4+dx];
+                    recon_slice[(by*4+dy)*DIM + bx*4+dx] = (int16_t)VL264_CLAMP(v2, 0, 255);
+                }
+        }
+    }
+
     return bs->total_coeff;
+}
+
+// DC prediction: predict current block's DC from left/above reconstructed DC
+VL264_INTERNAL int16_t predict_dc(const int16_t* dc_map, int32_t bx, int32_t by) {
+    bool has_left = bx > 0;
+    bool has_top = by > 0;
+    if (has_left && has_top) {
+        return (int16_t)((dc_map[by * BSTRIDE + bx - 1] + dc_map[(by-1) * BSTRIDE + bx] + 1) >> 1);
+    } else if (has_left) {
+        return dc_map[by * BSTRIDE + bx - 1];
+    } else if (has_top) {
+        return dc_map[(by-1) * BSTRIDE + bx];
+    }
+    return 0;
 }
 
 // Phase 2: Write a coded block to the bitstream.
@@ -1433,12 +1476,11 @@ VL264_INTERNAL void write_coded_block(vl264_enc* e, bs_writer* w,
                                        int32_t bx, int32_t by) {
     if (bs->mb_type == MB_TYPE_I4x4) {
         bs_w_bit1(w, 0); // intra
-        // Compact mode: DC=1 bit "0", others="1" + 3-bit index (0-7 for modes 0-2,3-8)
         if (bs->mode == INTRA_DC) {
             bs_w_bit1(w, 0);
         } else {
             bs_w_bit1(w, 1);
-            int32_t idx = bs->mode < INTRA_DC ? bs->mode : bs->mode - 1; // skip DC in numbering
+            int32_t idx = bs->mode < INTRA_DC ? bs->mode : bs->mode - 1;
             bs_w_bits(w, (uint32_t)idx, 3);
         }
     } else {
@@ -1446,22 +1488,34 @@ VL264_INTERNAL void write_coded_block(vl264_enc* e, bs_writer* w,
         bs_w_se(w, bs->mv.x);
         bs_w_se(w, bs->mv.y);
     }
+
+    // Apply DC prediction before writing coefficients
+    int16_t coeff_out[16];
+    memcpy(coeff_out, bs->coeff, sizeof(coeff_out));
+    int16_t dc_pred = predict_dc(e->dc_map, bx, by);
+    coeff_out[0] = (int16_t)(coeff_out[0] - dc_pred); // encode DC as delta
+
     int32_t nc = 0;
     if (bx > 0) nc += e->nc_map[by * BSTRIDE + bx - 1];
     if (by > 0) nc += e->nc_map[(by-1) * BSTRIDE + bx];
     if (bx > 0 && by > 0) nc = (nc + 1) / 2;
-    cavlc_encode_block(w, bs->coeff, nc);
+    cavlc_encode_block(w, coeff_out, nc);
 }
 
-// Encode a full 128x128 slice with skip-run encoding.
-// Format: interleaved ue(skip_run) + coded_block_data.
-// Read ue(skip_run), skip that many, decode one coded block, repeat.
-// Final ue(skip_run) = remaining blocks to end.
+// Early skip threshold: if SAD < threshold, skip without DCT/quant.
+// Threshold scales with QP (higher QP = more aggressive skip).
+VL264_INTERNAL int32_t early_skip_threshold(int32_t qp) {
+    // Approximate: at QP=20, threshold ~32; at QP=40, threshold ~256
+    return 16 + (qp * qp / 8);
+}
+
+// Encode a full 128x128 slice with skip-run encoding and DC prediction.
 VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
                                   const int16_t* cur, int16_t* recon,
                                   const int16_t* ref, bool is_iframe,
                                   int32_t qp_base) {
     memset(e->nc_map, 0, sizeof(e->nc_map));
+    memset(e->dc_map, 0, sizeof(e->dc_map));
 
     if (!is_iframe && ref) {
         memcpy(recon, ref, DIM * DIM * sizeof(int16_t));
@@ -1470,33 +1524,54 @@ VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
     }
 
     int32_t skip_run = 0;
+    int32_t early_thresh = early_skip_threshold(qp_base);
 
     for (int32_t by = 0; by < BSTRIDE; by++) {
         for (int32_t bx = 0; bx < BSTRIDE; bx++) {
+            // Early skip for P-frames: if zero-MV SAD is very low, skip without DCT
+            if (!is_iframe && ref) {
+                int16_t orig[16], ref_blk[16];
+                for (int dy = 0; dy < 4; dy++)
+                    for (int dx = 0; dx < 4; dx++)
+                        orig[dy*4+dx] = cur[(by*4+dy)*DIM + bx*4+dx];
+                get_block(ref, bx*4, by*4, ref_blk);
+                int32_t sad = sad_4x4(orig, ref_blk);
+                if (sad < early_thresh) {
+                    // Skip: keep reference prediction
+                    skip_run++;
+                    e->nc_map[by * BSTRIDE + bx] = 0;
+                    e->dc_map[by * BSTRIDE + bx] = 0; // skip blocks have DC=0 in prediction chain
+                    e->stats.skip_blocks++;
+                    e->stats.total_blocks++;
+                    e->stats.zero_coeff_blocks++;
+                    continue;
+                }
+            }
+
             block_state_t bs;
             int32_t tc = try_encode_block(e, &bs, cur, recon, ref, bx, by, is_iframe, qp_base);
 
             if (tc == 0) {
-                // True skip (total_coeff=0 means safe to skip — encoder ensured this)
                 skip_run++;
                 e->nc_map[by * BSTRIDE + bx] = 0;
+                e->dc_map[by * BSTRIDE + bx] = 0; // skip: DC=0 in prediction chain
                 e->stats.skip_blocks++;
                 e->stats.total_blocks++;
                 e->stats.zero_coeff_blocks++;
             } else {
-                // Coded block: write skip_run then block data
+                e->dc_map[by * BSTRIDE + bx] = bs.coeff[0]; // quantized DC for prediction
+
                 bs_w_ue(w, (uint32_t)skip_run);
                 skip_run = 0;
                 write_coded_block(e, w, &bs, bx, by);
-                e->nc_map[by * BSTRIDE + bx] = (int16_t)tc;
+                e->nc_map[by * BSTRIDE + bx] = (int16_t)(tc > 0 ? tc : 1);
                 e->stats.total_blocks++;
-                e->stats.avg_nonzero_coeffs += (float)tc;
+                e->stats.avg_nonzero_coeffs += (float)VL264_MAX(tc, 0);
                 if (bs.mb_type == MB_TYPE_I4x4) e->stats.intra_blocks++;
                 else e->stats.inter_blocks++;
             }
         }
     }
-    // Write final skip run
     bs_w_ue(w, (uint32_t)skip_run);
 }
 
@@ -1623,12 +1698,13 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
         }
 
         // Determine I or P frame
-        // I-frame interval: quality-dependent
-        int32_t iframe_interval;
-        switch (e->cfg.quality) {
-        case VL264_MAX:     iframe_interval = 16; break;
-        case VL264_DEFAULT: iframe_interval = 32; break;
-        default:            iframe_interval = 64; break;
+        int32_t iframe_interval = e->cfg.iframe_interval;
+        if (iframe_interval <= 0) {
+            switch (e->cfg.quality) {
+            case VL264_MAX:     iframe_interval = 16; break;
+            case VL264_DEFAULT: iframe_interval = 32; break;
+            default:            iframe_interval = 64; break;
+            }
         }
         bool is_iframe = should_force_iframe(e->slice_order, ci, iframe_interval);
 
@@ -1707,6 +1783,7 @@ struct vl264_dec {
     int16_t* lod_upsampled;
 
     int16_t nc_map[BSTRIDE * BSTRIDE];
+    int16_t dc_map[BSTRIDE * BSTRIDE]; // DC values for DC prediction (mirrors encoder)
     uint32_t slice_order[DIM];
 
     // Streaming state
@@ -1755,9 +1832,14 @@ VL264_INTERNAL void decode_block(vl264_dec* d, bs_reader* r,
     int16_t coeff[16];
     cavlc_decode_block(r, coeff, nc);
 
+    // Undo DC prediction: add back predicted DC
+    int16_t dc_pred = predict_dc(d->dc_map, bx, by);
+    coeff[0] = (int16_t)(coeff[0] + dc_pred);
+
     int32_t total_coeff = 0;
     for (int i = 0; i < 16; i++) if (coeff[i] != 0) total_coeff++;
     d->nc_map[by * BSTRIDE + bx] = (int16_t)total_coeff;
+    d->dc_map[by * BSTRIDE + bx] = coeff[0]; // store for next block's prediction
 
     // Dequant + inverse DCT
     dequant4x4(coeff, qp);
@@ -1790,6 +1872,7 @@ VL264_INTERNAL void decode_slice_blocks(vl264_dec* d, bs_reader* r,
                                          int16_t* recon, const int16_t* ref,
                                          int32_t qp, bool is_iframe) {
     memset(d->nc_map, 0, sizeof(d->nc_map));
+    memset(d->dc_map, 0, sizeof(d->dc_map));
 
     if (!is_iframe && ref) {
         memcpy(recon, ref, DIM * DIM * sizeof(int16_t));
@@ -1966,13 +2049,15 @@ const char* vl264_version_str(void) {
 
 vl264_cfg vl264_default_cfg(void) {
     return (vl264_cfg){
-        .quality        = VL264_DEFAULT,
-        .qp             = 0, // auto
-        .qp_sensitivity = 0.6f,
-        .axis           = VL264_AXIS_AUTO,
-        .boundary_pred  = false,
-        .lod_delta      = false,
-        .morton_order   = false,
+        .quality         = VL264_DEFAULT,
+        .qp              = 0, // auto
+        .qp_sensitivity  = 0.6f,
+        .axis            = VL264_AXIS_AUTO,
+        .boundary_pred   = false,
+        .lod_delta       = false,
+        .morton_order    = false,
+        .iframe_interval = 0, // auto from quality
+        .max_error       = 0, // unlimited
     };
 }
 
