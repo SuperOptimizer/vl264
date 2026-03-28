@@ -1486,23 +1486,23 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
             recon_slice[(by*4+dy)*DIM + bx*4+dx] = (int16_t)VL264_CLAMP(v, 0, 255);
         }
 
-    // Max error clamping: if any pixel exceeds max_error, re-encode with QP=1
-    if (e->cfg.max_error > 0) {
-        int32_t max_err = 0;
-        for (int dy = 0; dy < 4; dy++)
-            for (int dx = 0; dx < 4; dx++) {
-                int32_t err = abs(orig[dy*4+dx] - recon_slice[(by*4+dy)*DIM + bx*4+dx]);
-                if (err > max_err) max_err = err;
-            }
-        if (max_err > e->cfg.max_error && qp > 4) {
-            // Re-encode with lower QP to bring error within bounds
-            int32_t retry_qp = VL264_MAX(qp / 2, 1);
+    // Max error clamping: iteratively lower QP until error is within bounds
+    if (e->cfg.max_error > 0 && qp > 1) {
+        int32_t retry_qp = qp;
+        for (int attempt = 0; attempt < 4 && retry_qp > 1; attempt++) {
+            int32_t max_err = 0;
+            for (int dy = 0; dy < 4; dy++)
+                for (int dx = 0; dx < 4; dx++) {
+                    int32_t err = abs(orig[dy*4+dx] - recon_slice[(by*4+dy)*DIM + bx*4+dx]);
+                    if (err > max_err) max_err = err;
+                }
+            if (max_err <= e->cfg.max_error) break;
+            retry_qp = VL264_MAX(retry_qp / 2, 1);
             for (int i = 0; i < 16; i++) residual[i] = (int16_t)(orig[i] - bs->pred[i]);
             dct4x4_fwd(residual, bs->coeff);
             quant4x4(bs->coeff, retry_qp, bs->mb_type == MB_TYPE_I4x4);
             bs->total_coeff = 0;
             for (int i = 0; i < 16; i++) if (bs->coeff[i] != 0) bs->total_coeff++;
-            // Re-reconstruct
             memcpy(dq, bs->coeff, sizeof(dq));
             dequant4x4(dq, retry_qp);
             dct4x4_inv(dq, recon_res);
@@ -1603,8 +1603,17 @@ VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
                         orig[dy*4+dx] = cur[(by*4+dy)*DIM + bx*4+dx];
                 get_block(ref, bx*4, by*4, ref_blk);
                 int32_t sad = sad_4x4(orig, ref_blk);
-                if (sad < early_thresh) {
-                    // Skip: keep reference prediction
+                // Check max error before allowing early skip
+                bool allow_skip = (sad < early_thresh);
+                if (allow_skip && e->cfg.max_error > 0) {
+                    int32_t max_err = 0;
+                    for (int i = 0; i < 16; i++) {
+                        int32_t err = abs(orig[i] - ref_blk[i]);
+                        if (err > max_err) max_err = err;
+                    }
+                    if (max_err > e->cfg.max_error) allow_skip = false;
+                }
+                if (allow_skip) {
                     skip_run++;
                     e->nc_map[by * BSTRIDE + bx] = 0;
                     e->dc_map[by * BSTRIDE + bx] = 0; // skip blocks have DC=0 in prediction chain
