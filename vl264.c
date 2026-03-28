@@ -1400,11 +1400,11 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
                                          const int16_t* ref_slice,
                                          int32_t bx, int32_t by,
                                          bool is_iframe, int32_t qp) {
-    int16_t orig[16];
+    int16_t* orig = bs->orig;
+    int16_t zcoeff[16] = {0}; // zero-MV quantized coefficients (reused later)
     for (int dy = 0; dy < 4; dy++)
         for (int dx = 0; dx < 4; dx++)
             orig[dy*4+dx] = cur_slice[(by*4+dy) * DIM + bx*4+dx];
-    memcpy(bs->orig, orig, sizeof(bs->orig));
 
     bs->mv = (vl264_mv){0, 0};
     bs->mode = 0;
@@ -1412,10 +1412,11 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
     if (is_iframe || !ref_slice) {
         int16_t top[4], left[4], tl;
         get_neighbors(recon_slice, bx, by, top, left, &tl);
+        // FAST: DC only. DEFAULT: DC+H+V. MAX: all modes.
         intra_pred_4x4(bs->pred, INTRA_DC, top, left, tl);
-        int32_t best = sad_4x4(orig, bs->pred);
         bs->mode = INTRA_DC;
-        if (best > 32 || e->cfg.quality >= VL264_DEFAULT) {
+        if (e->cfg.quality >= VL264_DEFAULT) {
+            int32_t best = sad_4x4(orig, bs->pred);
             int16_t tmp[16];
             intra_pred_4x4(tmp, INTRA_HORIZ, top, left, tl);
             int32_t c = sad_4x4(orig, tmp);
@@ -1423,13 +1424,12 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
             intra_pred_4x4(tmp, INTRA_VERT, top, left, tl);
             c = sad_4x4(orig, tmp);
             if (c < best) { best = c; bs->mode = INTRA_VERT; memcpy(bs->pred, tmp, 32); }
-        }
-        if (e->cfg.quality >= VL264_MAX) {
-            for (int m = INTRA_DDL; m < INTRA_NUM_MODES; m++) {
-                int16_t tmp[16];
-                intra_pred_4x4(tmp, m, top, left, tl);
-                int32_t c = sad_4x4(orig, tmp);
-                if (c < best) { best = c; bs->mode = m; memcpy(bs->pred, tmp, 32); }
+            if (e->cfg.quality >= VL264_MAX) {
+                for (int m = INTRA_DDL; m < INTRA_NUM_MODES; m++) {
+                    intra_pred_4x4(tmp, m, top, left, tl);
+                    c = sad_4x4(orig, tmp);
+                    if (c < best) { best = c; bs->mode = m; memcpy(bs->pred, tmp, 32); }
+                }
             }
         }
         bs->mb_type = MB_TYPE_I4x4;
@@ -1440,7 +1440,7 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
         bs->mb_type = MB_TYPE_P;
 
         // Quick zero-MV check: compute residual, DCT, quant
-        int16_t zres[16], zcoeff[16];
+        int16_t zres[16];
         for (int i = 0; i < 16; i++) zres[i] = (int16_t)(orig[i] - bs->pred[i]);
         dct4x4_fwd(zres, zcoeff);
         quant4x4(zcoeff, qp, false);
@@ -1465,11 +1465,15 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
         }
     }
 
-    // Residual, DCT, quant
+    // Residual, DCT, quant — skip if we already computed it for zero-MV
     int16_t residual[16];
-    for (int i = 0; i < 16; i++) residual[i] = (int16_t)(orig[i] - bs->pred[i]);
-    dct4x4_fwd(residual, bs->coeff);
-    quant4x4(bs->coeff, qp, bs->mb_type == MB_TYPE_I4x4);
+    if (!is_iframe && ref_slice && bs->mv.x == 0 && bs->mv.y == 0) {
+        memcpy(bs->coeff, zcoeff, sizeof(bs->coeff));
+    } else {
+        for (int i = 0; i < 16; i++) residual[i] = (int16_t)(orig[i] - bs->pred[i]);
+        dct4x4_fwd(residual, bs->coeff);
+        quant4x4(bs->coeff, qp, bs->mb_type == MB_TYPE_I4x4);
+    }
 
     bs->total_coeff = 0;
     for (int i = 0; i < 16; i++) if (bs->coeff[i] != 0) bs->total_coeff++;
