@@ -351,7 +351,7 @@ VL264_INTERNAL void read_slice_hdr(bs_reader* r, vl264_slice_hdr* h) {
 //   [ 2  1 -1 -2 ]
 //   [ 1 -1 -1  1 ]
 //   [ 1 -2  2 -1 ]
-VL264_INTERNAL VL264_HOT void dct4x4_fwd(const int16_t in[16], int16_t out[16]) {
+VL264_INTERNAL VL264_HOT void dct4x4_fwd(const int16_t in[static restrict 16], int16_t out[static restrict 16]) {
     int16_t tmp[16];
 
     // Horizontal pass
@@ -376,7 +376,7 @@ VL264_INTERNAL VL264_HOT void dct4x4_fwd(const int16_t in[16], int16_t out[16]) 
 }
 
 // Inverse 4x4 integer DCT
-VL264_INTERNAL VL264_HOT void dct4x4_inv(const int16_t in[16], int16_t out[16]) {
+VL264_INTERNAL VL264_HOT void dct4x4_inv(const int16_t in[static restrict 16], int16_t out[static restrict 16]) {
     int16_t tmp[16];
 
     // Horizontal pass
@@ -517,7 +517,7 @@ VL264_INTERNAL bool get_neighbors(const int16_t* recon, int32_t bx, int32_t by,
     return has_top || has_left;
 }
 
-VL264_INTERNAL void intra_pred_4x4(int16_t pred[16], int32_t mode,
+VL264_INTERNAL void intra_pred_4x4(int16_t pred[static 16], int32_t mode,
                                      const int16_t top[4], const int16_t left[4],
                                      int16_t tl) {
     switch (mode) {
@@ -643,10 +643,13 @@ VL264_INTERNAL void intra_pred_4x4(int16_t pred[16], int32_t mode,
     }
 }
 
-// SAD for 4x4
-VL264_INTERNAL VL264_HOT VL264_PURE int32_t sad_4x4(const int16_t a[16], const int16_t b[16]) {
+// SAD for 4x4 — branchless abs via arithmetic
+VL264_INTERNAL VL264_HOT VL264_PURE int32_t sad_4x4(const int16_t a[static 16], const int16_t b[static 16]) {
     int32_t sum = 0;
-    for (int i = 0; i < 16; i++) sum += abs(a[i] - b[i]);
+    for (int i = 0; i < 16; i++) {
+        int32_t d = (int32_t)a[i] - (int32_t)b[i];
+        sum += (d ^ (d >> 31)) - (d >> 31); // branchless abs
+    }
     return sum;
 }
 
@@ -660,9 +663,20 @@ VL264_INTERNAL VL264_HOT VL264_PURE int32_t sad_4x4(const int16_t a[16], const i
 
 typedef struct { int16_t x, y; } vl264_mv;
 
-// Get a 4x4 block from a slice buffer at position (bx*4+ox, by*4+oy) with bounds clamping
+// Get a 4x4 block from a slice buffer. Fast path for interior blocks.
 VL264_INTERNAL VL264_HOT void get_block(const int16_t* slice, int32_t px, int32_t py,
-                               int16_t out[16]) {
+                               int16_t out[static 16]) {
+    // Fast path: block is fully inside the slice (most common)
+    if (VL264_LIKELY(px >= 0 && px + 3 < DIM && py >= 0 && py + 3 < DIM)) {
+        const int16_t* src = slice + py * DIM + px;
+        for (int dy = 0; dy < 4; dy++) {
+            out[dy*4+0] = src[0]; out[dy*4+1] = src[1];
+            out[dy*4+2] = src[2]; out[dy*4+3] = src[3];
+            src += DIM;
+        }
+        return;
+    }
+    // Slow path: clamp at boundaries
     for (int dy = 0; dy < 4; dy++) {
         for (int dx = 0; dx < 4; dx++) {
             int32_t x = VL264_CLAMP(px + dx, 0, DIM - 1);
@@ -721,7 +735,7 @@ VL264_INTERNAL int16_t interp_pixel(const int16_t* ref, int32_t qx, int32_t qy) 
 
 // Get a 4x4 block at sub-pixel position
 VL264_INTERNAL void mc_block(const int16_t* ref, int32_t px, int32_t py,
-                              vl264_mv mv, int16_t out[16]) {
+                              vl264_mv mv, int16_t out[static 16]) {
     int32_t qx = px * 4 + mv.x;
     int32_t qy = py * 4 + mv.y;
     for (int dy = 0; dy < 4; dy++) {
@@ -809,7 +823,7 @@ VL264_INTERNAL VL264_HOT int32_t rice_decode(bs_reader* r, int32_t k) {
 //   10 = sparse: ue(total_coeff-2) + ue(last_sig) + sig_map + levels
 //   11 = dense:  16 × se(level) — for low QP when most coefficients are non-zero
 
-VL264_INTERNAL VL264_HOT void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], int32_t nc) {
+VL264_INTERNAL VL264_HOT void cavlc_encode_block(bs_writer* w, const int16_t coeff[static 16], int32_t nc) {
     (void)nc;
 
     int32_t total_coeff = 0;
@@ -857,7 +871,7 @@ VL264_INTERNAL VL264_HOT void cavlc_encode_block(bs_writer* w, const int16_t coe
         rice_encode(w, levels[i], 0); // k=0 for sparse
 }
 
-VL264_INTERNAL VL264_HOT void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t nc) {
+VL264_INTERNAL VL264_HOT void cavlc_decode_block(bs_reader* r, int16_t coeff[static 16], int32_t nc) {
     (void)nc;
     memset(coeff, 0, 16 * sizeof(int16_t));
 

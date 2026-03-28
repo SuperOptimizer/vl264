@@ -17,6 +17,7 @@ option(VL264_UBSAN        "Enable UndefinedBehaviorSanitizer"  OFF)
 option(VL264_TSAN         "Enable ThreadSanitizer"             OFF)
 option(VL264_COVERAGE     "Enable code coverage profiling"     OFF)
 option(VL264_PROFILE      "Enable performance profiling"       OFF)
+option(VL264_MIMALLOC     "Use mimalloc allocator"             OFF)
 option(VL264_FTIME_TRACE  "Enable -ftime-trace compile stats"  OFF)
 
 # ── Sanitizer flags (layerable) ─────────────────────────────────────────────
@@ -71,6 +72,16 @@ target_compile_options(vl264 PRIVATE
     ${VL264_SAN_FLAGS} ${VL264_COV_FLAGS} ${VL264_PROF_FLAGS} ${VL264_FTIME_FLAGS}
 )
 target_link_options(vl264 PRIVATE ${VL264_SAN_LINK})
+
+if(VL264_MIMALLOC)
+    find_package(mimalloc QUIET)
+    if(mimalloc_FOUND)
+        target_link_libraries(vl264 PRIVATE mimalloc)
+        target_compile_definitions(vl264 PRIVATE VL264_USE_MIMALLOC)
+    else()
+        message(WARNING "mimalloc not found, using system allocator")
+    endif()
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(vl264 PRIVATE -O0 -g3)
