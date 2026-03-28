@@ -1389,7 +1389,7 @@ VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
             if (best_sad > 16) {
                 int32_t me_sad;
                 vl264_mv me_mv = me_search_int(orig, ref_slice, bx, by,
-                                                (e->cfg.quality == VL264_FAST) ? 1 : 2, &me_sad);
+                                                (e->cfg.quality == VL264_FAST) ? 3 : 4, &me_sad);
                 if (e->cfg.quality >= VL264_DEFAULT)
                     me_mv = me_refine_qpel(orig, ref_slice, bx, by, me_mv, &me_sad);
                 if (me_sad < best_sad) {
