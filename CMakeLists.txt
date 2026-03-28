@@ -138,24 +138,35 @@ if(VL264_COVERAGE)
     )
 endif()
 
-# ── PGO (Profile-Guided Optimization) ───────────────────────────────────────
-add_custom_target(pgo-gen
+# ── Riced build: LTO + PGO + aggressive opts ────────────────────────────────
+# Usage: cmake --build build --target riced
+# This produces a maximally optimized vl264_test binary in build-riced/
+add_custom_target(riced
+    # Step 1: PGO instrumented build
     COMMAND ${CMAKE_COMMAND} -B ${CMAKE_BINARY_DIR}-pgo-gen
             -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
             -DCMAKE_C_FLAGS=-fprofile-generate
-            -DCMAKE_EXE_LINKER_FLAGS=-fprofile-generate
+            -DCMAKE_EXE_LINKER_FLAGS=-fprofile-generate\ -fuse-ld=lld
+            -DVL264_BUILD_TESTS=ON
             ${CMAKE_SOURCE_DIR}
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}-pgo-gen
-    COMMAND ${CMAKE_BINARY_DIR}-pgo-gen/vl264_test --roundtrip
-    COMMENT "Building PGO instrumented binary and running training"
-)
-
-add_custom_target(pgo-use
-    COMMAND ${CMAKE_COMMAND} -B ${CMAKE_BINARY_DIR}-pgo-use
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}-pgo-gen --clean-first
+    # Step 2: PGO training on real workloads
+    COMMAND ${CMAKE_BINARY_DIR}-pgo-gen/vl264_test --roundtrip --sweep --props --edge
+    # Step 3: Merge profiles
+    COMMAND llvm-profdata merge -sparse
+            ${CMAKE_BINARY_DIR}-pgo-gen/default_*.profraw
+            -o ${CMAKE_BINARY_DIR}-pgo.profdata
+    # Step 4: Final build with PGO + LTO + aggressive flags
+    COMMAND ${CMAKE_COMMAND} -B ${CMAKE_BINARY_DIR}-riced
             -DCMAKE_BUILD_TYPE=Release
-            -DCMAKE_C_FLAGS=-fprofile-use=${CMAKE_BINARY_DIR}-pgo-gen/default.profdata
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_C_FLAGS=-fprofile-use=${CMAKE_BINARY_DIR}-pgo.profdata\ -flto
+            -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld\ -Wl,--icf=all\ -Wl,--gc-sections\ -flto
+            -DVL264_BUILD_TESTS=ON
             ${CMAKE_SOURCE_DIR}
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}-pgo-use
-    COMMENT "Building PGO-optimized binary"
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}-riced --clean-first
+    COMMENT "Building riced binary: PGO + LTO + ICF + GC"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DEPENDS pgo-gen
 )

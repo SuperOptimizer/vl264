@@ -16,13 +16,38 @@
 #define VL264_RESTRICT    restrict
 #define VL264_ALIGNED(n)  _Alignas(n)
 
+// Compiler hints
+#if defined(__clang__) || defined(__GNUC__)
+#define VL264_LIKELY(x)     __builtin_expect(!!(x), 1)
+#define VL264_UNLIKELY(x)   __builtin_expect(!!(x), 0)
+#define VL264_HOT            __attribute__((hot))
+#define VL264_COLD           __attribute__((cold))
+#define VL264_PURE           __attribute__((pure))
+#define VL264_CONST_FN       __attribute__((const))
+#define VL264_FLATTEN        __attribute__((flatten))
+#define VL264_ALWAYS_INLINE  __attribute__((always_inline)) static inline
+#define VL264_NOINLINE       __attribute__((noinline))
+#define VL264_PREFETCH(p)    __builtin_prefetch(p)
+#else
+#define VL264_LIKELY(x)     (x)
+#define VL264_UNLIKELY(x)   (x)
+#define VL264_HOT
+#define VL264_COLD
+#define VL264_PURE
+#define VL264_CONST_FN
+#define VL264_FLATTEN
+#define VL264_ALWAYS_INLINE  static inline
+#define VL264_NOINLINE
+#define VL264_PREFETCH(p)
+#endif
+
 #define VL264_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define VL264_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define VL264_CLAMP(x, lo, hi) VL264_MIN(VL264_MAX((x), (lo)), (hi))
 
 // Safe shift: avoids UB when shift >= 32
-static inline uint32_t shl32(uint32_t v, int32_t n) { return n >= 32 ? 0 : n <= 0 ? v : v << n; }
-static inline uint32_t shr32(uint32_t v, int32_t n) { return n >= 32 ? 0 : n <= 0 ? v : v >> n; }
+VL264_ALWAYS_INLINE VL264_CONST_FN uint32_t shl32(uint32_t v, int32_t n) { return n >= 32 ? 0 : n <= 0 ? v : v << n; }
+VL264_ALWAYS_INLINE VL264_CONST_FN uint32_t shr32(uint32_t v, int32_t n) { return n >= 32 ? 0 : n <= 0 ? v : v >> n; }
 
 #define DIM   128
 #define BDIM  4    // block dimension
@@ -87,10 +112,10 @@ VL264_INTERNAL void bs_w_flush_cache(bs_writer* w) {
     }
 }
 
-VL264_INTERNAL void bs_w_bits(bs_writer* w, uint32_t val, int32_t n) {
-    if (n <= 0) return;
-    // Fast path: fits entirely in cache (common case: n <= 24, bits_left >= n)
-    if (n <= w->bits_left && n < 32) {
+VL264_INTERNAL VL264_HOT void bs_w_bits(bs_writer* w, uint32_t val, int32_t n) {
+    if (VL264_UNLIKELY(n <= 0)) return;
+    // Fast path: fits entirely in cache (common case)
+    if (VL264_LIKELY(n <= w->bits_left && n < 32)) {
         w->cache |= (val & ((1u << n) - 1)) << (w->bits_left - n);
         w->bits_left -= n;
         if (w->bits_left <= 8) bs_w_flush_cache(w);
@@ -173,7 +198,7 @@ VL264_INTERNAL void bs_r_refill(bs_reader* r) {
     }
 }
 
-VL264_INTERNAL uint32_t bs_r_bits(bs_reader* r, int32_t n) {
+VL264_INTERNAL VL264_HOT uint32_t bs_r_bits(bs_reader* r, int32_t n) {
     if (n <= 0) return 0;
     bs_r_refill(r);
     // Fast path (n < 25 and enough bits — almost always true)
@@ -326,7 +351,7 @@ VL264_INTERNAL void read_slice_hdr(bs_reader* r, vl264_slice_hdr* h) {
 //   [ 2  1 -1 -2 ]
 //   [ 1 -1 -1  1 ]
 //   [ 1 -2  2 -1 ]
-VL264_INTERNAL void dct4x4_fwd(const int16_t in[16], int16_t out[16]) {
+VL264_INTERNAL VL264_HOT void dct4x4_fwd(const int16_t in[16], int16_t out[16]) {
     int16_t tmp[16];
 
     // Horizontal pass
@@ -351,7 +376,7 @@ VL264_INTERNAL void dct4x4_fwd(const int16_t in[16], int16_t out[16]) {
 }
 
 // Inverse 4x4 integer DCT
-VL264_INTERNAL void dct4x4_inv(const int16_t in[16], int16_t out[16]) {
+VL264_INTERNAL VL264_HOT void dct4x4_inv(const int16_t in[16], int16_t out[16]) {
     int16_t tmp[16];
 
     // Horizontal pass
@@ -420,7 +445,7 @@ static const uint8_t zigzag4x4[16] = {
     0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15
 };
 
-VL264_INTERNAL void quant4x4(int16_t coeff[16], int32_t qp, bool is_intra) {
+VL264_INTERNAL VL264_HOT void quant4x4(int16_t coeff[16], int32_t qp, bool is_intra) {
     int32_t qp_rem = qp % 6;
     int32_t qp_div = qp / 6;
     // Wider dead zone for inter blocks: /4 instead of /6 produces more zeros
@@ -435,7 +460,7 @@ VL264_INTERNAL void quant4x4(int16_t coeff[16], int32_t qp, bool is_intra) {
     }
 }
 
-VL264_INTERNAL void dequant4x4(int16_t coeff[16], int32_t qp) {
+VL264_INTERNAL VL264_HOT void dequant4x4(int16_t coeff[16], int32_t qp) {
     int32_t qp_rem = qp % 6;
     int32_t qp_div = qp / 6;
 
@@ -619,7 +644,7 @@ VL264_INTERNAL void intra_pred_4x4(int16_t pred[16], int32_t mode,
 }
 
 // SAD for 4x4
-VL264_INTERNAL int32_t sad_4x4(const int16_t a[16], const int16_t b[16]) {
+VL264_INTERNAL VL264_HOT VL264_PURE int32_t sad_4x4(const int16_t a[16], const int16_t b[16]) {
     int32_t sum = 0;
     for (int i = 0; i < 16; i++) sum += abs(a[i] - b[i]);
     return sum;
@@ -636,7 +661,7 @@ VL264_INTERNAL int32_t sad_4x4(const int16_t a[16], const int16_t b[16]) {
 typedef struct { int16_t x, y; } vl264_mv;
 
 // Get a 4x4 block from a slice buffer at position (bx*4+ox, by*4+oy) with bounds clamping
-VL264_INTERNAL void get_block(const int16_t* slice, int32_t px, int32_t py,
+VL264_INTERNAL VL264_HOT void get_block(const int16_t* slice, int32_t px, int32_t py,
                                int16_t out[16]) {
     for (int dy = 0; dy < 4; dy++) {
         for (int dx = 0; dx < 4; dx++) {
@@ -743,7 +768,7 @@ VL264_INTERNAL vl264_mv me_refine_qpel(const int16_t orig[16], const int16_t* re
 // Rice (Golomb-Rice) coding for signed coefficient levels.
 // Unary prefix for quotient, k-bit suffix for remainder, sign bit.
 // Escape: if quotient > 12, write 12 zeros + stop + ue(quotient-12) instead.
-VL264_INTERNAL void rice_encode(bs_writer* w, int32_t val, int32_t k) {
+VL264_INTERNAL VL264_HOT void rice_encode(bs_writer* w, int32_t val, int32_t k) {
     uint32_t absval = (uint32_t)abs(val);
     uint32_t q = absval >> k;
     uint32_t rem = absval & (shl32(1u, k) - 1);
@@ -760,7 +785,7 @@ VL264_INTERNAL void rice_encode(bs_writer* w, int32_t val, int32_t k) {
     if (absval > 0) bs_w_bit1(w, val < 0 ? 1 : 0);
 }
 
-VL264_INTERNAL int32_t rice_decode(bs_reader* r, int32_t k) {
+VL264_INTERNAL VL264_HOT int32_t rice_decode(bs_reader* r, int32_t k) {
     uint32_t q = 0;
     for (;;) {
         if (bs_r_bit1(r)) break; // stop bit → normal path (q < 12)
@@ -784,7 +809,7 @@ VL264_INTERNAL int32_t rice_decode(bs_reader* r, int32_t k) {
 //   10 = sparse: ue(total_coeff-2) + ue(last_sig) + sig_map + levels
 //   11 = dense:  16 × se(level) — for low QP when most coefficients are non-zero
 
-VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], int32_t nc) {
+VL264_INTERNAL VL264_HOT void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], int32_t nc) {
     (void)nc;
 
     int32_t total_coeff = 0;
@@ -832,7 +857,7 @@ VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], in
         rice_encode(w, levels[i], 0); // k=0 for sparse
 }
 
-VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t nc) {
+VL264_INTERNAL VL264_HOT void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t nc) {
     (void)nc;
     memset(coeff, 0, 16 * sizeof(int16_t));
 
@@ -1176,7 +1201,7 @@ typedef struct {
 
 // Phase 1: Compute prediction, residual, DCT, quant. Write reconstruction.
 // Returns total_coeff (0 = skip candidate).
-VL264_INTERNAL int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
+VL264_INTERNAL VL264_HOT VL264_FLATTEN int32_t try_encode_block(vl264_enc* e, block_state_t* bs,
                                          const int16_t* cur_slice, int16_t* recon_slice,
                                          const int16_t* ref_slice,
                                          int32_t bx, int32_t by,
@@ -1400,7 +1425,7 @@ VL264_INTERNAL int32_t early_skip_threshold(int32_t qp) {
 }
 
 // Encode a full 128x128 slice with skip-run encoding and DC prediction.
-VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
+VL264_INTERNAL VL264_HOT void encode_slice(vl264_enc* e, bs_writer* w,
                                   const int16_t* cur, int16_t* recon,
                                   const int16_t* ref, bool is_iframe,
                                   int32_t qp_base) {
@@ -1722,7 +1747,7 @@ struct vl264_dec {
 
 // Decode a single coded 4x4 block (skip handling is in decode_slice_blocks)
 // Format: bit1(type) + [4-bit mode | se(mvx)+se(mvy)] + coefficients
-VL264_INTERNAL void decode_block(vl264_dec* d, bs_reader* r,
+VL264_INTERNAL VL264_HOT void decode_block(vl264_dec* d, bs_reader* r,
                                   int16_t* recon_slice, const int16_t* ref_slice,
                                   int32_t bx, int32_t by, int32_t qp_base) {
     int32_t qp = qp_base;
@@ -1795,7 +1820,7 @@ VL264_INTERNAL void decode_block(vl264_dec* d, bs_reader* r,
 // Decode all blocks in a slice.
 // Format: skip_run encoding. Read ue(skip_run), skip that many blocks,
 // then decode one coded block. Repeat until all 1024 blocks processed.
-VL264_INTERNAL void decode_slice_blocks(vl264_dec* d, bs_reader* r,
+VL264_INTERNAL VL264_HOT void decode_slice_blocks(vl264_dec* d, bs_reader* r,
                                          int16_t* recon, const int16_t* ref,
                                          int32_t qp, bool is_iframe) {
     memset(d->nc_map, 0, sizeof(d->nc_map));
@@ -1964,7 +1989,7 @@ VL264_INTERNAL vl264_status decode_chunk_impl(vl264_dec* d,
 // Section 20: Public API
 // ═════════════════════════════════════════════════════════════════════════════
 
-const char* vl264_status_str(vl264_status s) {
+VL264_COLD const char* vl264_status_str(vl264_status s) {
     switch (s) {
     case VL264_OK:            return "ok";
     case VL264_ERR_NULL_ARG:  return "null argument";
@@ -2279,7 +2304,7 @@ void vl264_stats_compute(vl264_stats* s, const uint8_t* original,
     }
 }
 
-void vl264_stats_print(const vl264_stats* s, FILE* out) {
+VL264_COLD void vl264_stats_print(const vl264_stats* s, FILE* out) {
     if (!s || !out) return;
 
     fprintf(out, "┌─────────────────────────────────────────────────┐\n");
