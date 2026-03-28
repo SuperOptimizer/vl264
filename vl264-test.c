@@ -721,10 +721,11 @@ static void test_streaming(void) {
     vl264_dec* dec1 = vl264_dec_create();
     vl264_decode(dec1, out.data, out.size, NULL, NULL, full_decoded);
 
-    // Streaming decode
+    // Streaming decode — use axis-aware insertion
     vl264_dec* dec2 = vl264_dec_create();
     vl264_status s = vl264_decode_begin(dec2, out.data, out.size, NULL, NULL);
     TEST(s == VL264_OK, "streaming begin");
+    vl264_axis stream_axis = vl264_decode_axis(dec2);
 
     int slices_decoded = 0;
     while (slices_decoded < 128) {
@@ -732,19 +733,29 @@ static void test_streaming(void) {
         uint32_t slice_idx;
         s = vl264_decode_next_slice(dec2, slice_buf, &slice_idx);
         if (s != VL264_OK) break;
-        // Insert slice into volume (Z-axis assumed)
-        for (int y = 0; y < 128; y++)
-            for (int x = 0; x < 128; x++)
-                stream_decoded[slice_idx * 128 * 128 + y * 128 + x] = slice_buf[y * 128 + x];
+        // Axis-aware insertion
+        for (int a = 0; a < 128; a++) {
+            for (int b = 0; b < 128; b++) {
+                size_t vi;
+                switch (stream_axis) {
+                case VL264_AXIS_X: vi = (size_t)a * 128 * 128 + (size_t)b * 128 + slice_idx; break;
+                case VL264_AXIS_Y: vi = (size_t)a * 128 * 128 + (size_t)slice_idx * 128 + b; break;
+                default:           vi = (size_t)slice_idx * 128 * 128 + (size_t)a * 128 + b; break;
+                }
+                stream_decoded[vi] = slice_buf[a * 128 + b];
+            }
+        }
         slices_decoded++;
     }
-    printf("    decoded %d slices via streaming\n", slices_decoded);
+    printf("    decoded %d slices (axis=%d) via streaming\n", slices_decoded, stream_axis);
     TEST(slices_decoded == 128, "all 128 slices decoded");
 
-    // Note: streaming decode inserts into Z-axis positions but the encoder
-    // may use a different axis. Full comparison requires axis-aware insertion.
-    // For now, just verify streaming doesn't crash and decodes all slices.
-    printf("    streaming decode completed without errors\n");
+    // Compare full vs streaming decode
+    int diffs = 0;
+    for (size_t i = 0; i < VL264_CHUNK_VOXELS; i++)
+        if (full_decoded[i] != stream_decoded[i]) diffs++;
+    printf("    full vs streaming diffs: %d\n", diffs);
+    TEST(diffs == 0, "streaming matches full decode");
 
     vl264_free(out.data);
     vl264_enc_destroy(enc);

@@ -262,42 +262,21 @@ VL264_INTERNAL size_t nal_to_rbsp(const uint8_t* nal, size_t len,
 }
 
 // ── Length-prefixed NAL framing ──────────────────────────────────────────────
-// We use 4-byte big-endian length prefix instead of start codes.
-// This avoids the need for RBSP emulation prevention entirely.
-// Format: [4-byte length][1-byte nal_type][payload...]
+// 2-byte big-endian length prefix (max 65535 bytes per NAL).
+// Format: [2-byte length][1-byte nal_type][payload...]
 
-// Write a placeholder length prefix + NAL type. Returns offset to the length field.
-VL264_INTERNAL size_t write_nal_length_placeholder(uint8_t* buf, size_t cap, uint8_t nal_type) {
-    if (cap < 5) return 0;
-    // Length placeholder (will be patched later)
-    buf[0] = buf[1] = buf[2] = buf[3] = 0;
-    buf[4] = nal_type & 0x1F;
-    return 5;
-}
+#define NAL_LEN_BYTES 2
+#define NAL_MAX_SIZE  65535
 
-// Patch the length field at a given offset
-VL264_INTERNAL void patch_nal_length(uint8_t* buf, size_t length_offset, size_t payload_len) {
-    uint32_t len = (uint32_t)(payload_len + 1); // +1 for nal_type byte
-    buf[length_offset + 0] = (uint8_t)(len >> 24);
-    buf[length_offset + 1] = (uint8_t)(len >> 16);
-    buf[length_offset + 2] = (uint8_t)(len >> 8);
-    buf[length_offset + 3] = (uint8_t)(len);
-}
-
-// Read NAL units from length-prefixed format.
-// Returns number of NAL units found. offsets/sizes point to the nal_type byte (not length).
 VL264_INTERNAL size_t find_nal_units(const uint8_t* data, size_t size,
                                       size_t* offsets, size_t* sizes, size_t max_nals) {
     size_t count = 0;
     size_t pos = 0;
-    while (pos + 4 < size && count < max_nals) {
-        uint32_t len = ((uint32_t)data[pos] << 24) |
-                       ((uint32_t)data[pos+1] << 16) |
-                       ((uint32_t)data[pos+2] << 8) |
-                       ((uint32_t)data[pos+3]);
-        pos += 4; // skip length field
+    while (pos + NAL_LEN_BYTES < size && count < max_nals) {
+        uint32_t len = ((uint32_t)data[pos] << 8) | (uint32_t)data[pos+1];
+        pos += NAL_LEN_BYTES;
         if (len == 0 || pos + len > size) break;
-        offsets[count] = pos;      // points to nal_type byte
+        offsets[count] = pos;
         sizes[count] = (size_t)len;
         count++;
         pos += len;
@@ -908,21 +887,16 @@ VL264_INTERNAL vl264_mv me_refine_qpel(const int16_t orig[16], const int16_t* re
 // Section 9 & 10: CAVLC entropy coding + lookup tables
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Compact coefficient coding inspired by H.264 CAVLC.
-// Format:
-//   ue(total_coeff)             — 0-16 non-zero coefficients
-//   if total_coeff > 0:
-//     ue(last_sig_pos)          — last non-zero position in zigzag scan (0-15)
-//     significance map          — 1 bit per position 0..last_sig_pos-1 (is it non-zero?)
-//     levels                    — se(level) for each non-zero, reverse order
-//
-// Cost for 1 non-zero at DC:  ue(1)=1 + ue(0)=1 + se(level)=~5 = ~7 bits  (was 23)
-// Cost for 0 non-zero:        ue(0)=1 bit                                   (was 2)
+// Compact coefficient coding.
+// 3 modes signaled by 2-bit header:
+//   00 = all zero (1 bit total with the leading 0)
+//   01 = DC-only: just se(dc_level) — most common case at high QP
+//   10 = sparse: ue(total_coeff-2) + ue(last_sig) + sig_map + levels
+//   11 = dense:  16 × se(level) — for low QP when most coefficients are non-zero
 
 VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], int32_t nc) {
     (void)nc;
 
-    // Scan zigzag to find non-zero positions and last significant position
     int32_t total_coeff = 0;
     int32_t last_sig = -1;
     int16_t levels[16];
@@ -937,53 +911,79 @@ VL264_INTERNAL void cavlc_encode_block(bs_writer* w, const int16_t coeff[16], in
         }
     }
 
-    bs_w_ue(w, (uint32_t)total_coeff);
-    if (total_coeff == 0) return;
+    if (total_coeff == 0) {
+        bs_w_bits(w, 0, 2); // 00
+        return;
+    }
 
-    bs_w_ue(w, (uint32_t)last_sig);
+    if (total_coeff == 1 && last_sig == 0) {
+        // DC-only: very common at high QP
+        bs_w_bits(w, 1, 2); // 01
+        bs_w_se(w, levels[0]);
+        return;
+    }
 
-    // Write significance map: 1 bit per position 0..last_sig-1
-    // (last_sig position is implicitly significant)
-    for (int i = 0; i < last_sig; i++) {
+    if (total_coeff >= 12) {
+        // Dense: write all 16 coefficients
+        bs_w_bits(w, 3, 2); // 11
+        for (int i = 0; i < 16; i++)
+            bs_w_se(w, coeff[zigzag4x4[i]]);
+        return;
+    }
+
+    // Sparse: most general case
+    bs_w_bits(w, 2, 2); // 10
+    bs_w_ue(w, (uint32_t)(total_coeff - 1)); // -1 since we know it's >= 1, saves 1 bit on average
+    bs_w_bits(w, (uint32_t)last_sig, 4); // 4 bits for position 0-15 (fixed, more compact than ue for mid values)
+
+    for (int i = 0; i < last_sig; i++)
         bs_w_bit1(w, sig_map[i]);
-    }
 
-    // Write levels in reverse order (larger coefficients first = better exp-golomb)
-    for (int i = total_coeff - 1; i >= 0; i--) {
+    for (int i = total_coeff - 1; i >= 0; i--)
         bs_w_se(w, levels[i]);
-    }
 }
 
 VL264_INTERNAL void cavlc_decode_block(bs_reader* r, int16_t coeff[16], int32_t nc) {
     (void)nc;
     memset(coeff, 0, 16 * sizeof(int16_t));
 
-    uint32_t total_coeff = bs_r_ue(r);
-    if (total_coeff == 0) return;
+    uint32_t hdr = bs_r_bits(r, 2);
+
+    if (hdr == 0) return; // all zero
+
+    if (hdr == 1) {
+        // DC-only
+        coeff[zigzag4x4[0]] = (int16_t)bs_r_se(r);
+        return;
+    }
+
+    if (hdr == 3) {
+        // Dense: read all 16
+        for (int i = 0; i < 16; i++)
+            coeff[zigzag4x4[i]] = (int16_t)bs_r_se(r);
+        return;
+    }
+
+    // Sparse (hdr == 2)
+    uint32_t total_coeff = bs_r_ue(r) + 1;
     if (total_coeff > 16) total_coeff = 16;
 
-    uint32_t last_sig = bs_r_ue(r);
+    uint32_t last_sig = bs_r_bits(r, 4);
     if (last_sig > 15) last_sig = 15;
 
-    // Read significance map: 1 bit per position 0..last_sig-1
     uint8_t sig_map[16] = {0};
-    sig_map[last_sig] = 1; // last position is always significant
-    for (uint32_t i = 0; i < last_sig; i++) {
+    sig_map[last_sig] = 1;
+    for (uint32_t i = 0; i < last_sig; i++)
         sig_map[i] = (uint8_t)bs_r_bit1(r);
-    }
 
-    // Read levels in reverse order
     int16_t levels[16];
-    for (int i = (int)total_coeff - 1; i >= 0; i--) {
+    for (int i = (int)total_coeff - 1; i >= 0; i--)
         levels[i] = (int16_t)bs_r_se(r);
-    }
 
-    // Place into coefficient array
     int32_t li = 0;
     for (uint32_t i = 0; i <= last_sig && li < (int32_t)total_coeff; i++) {
-        if (sig_map[i]) {
+        if (sig_map[i])
             coeff[zigzag4x4[i]] = levels[li++];
-        }
     }
 }
 
@@ -1500,20 +1500,15 @@ VL264_INTERNAL void encode_slice(vl264_enc* e, bs_writer* w,
     bs_w_ue(w, (uint32_t)skip_run);
 }
 
-// Helper: begin a new NAL unit. Writes length placeholder + type byte.
-// Returns the offset where the length field starts (for patching later).
+// Helper: begin a new NAL unit. Writes 2-byte length placeholder + type byte.
 VL264_INTERNAL size_t bs_w_nal_begin(bs_writer* w, uint8_t nal_type) {
     bs_w_flush(w);
     bs_w_align(w);
     bs_w_flush(w);
     size_t length_offset = w->byte_pos;
-    if (w->byte_pos + 5 <= w->capacity) {
-        // 4-byte length placeholder
-        w->buf[w->byte_pos++] = 0;
-        w->buf[w->byte_pos++] = 0;
-        w->buf[w->byte_pos++] = 0;
-        w->buf[w->byte_pos++] = 0;
-        // NAL type byte
+    if (w->byte_pos + NAL_LEN_BYTES + 1 <= w->capacity) {
+        w->buf[w->byte_pos++] = 0; // length high byte placeholder
+        w->buf[w->byte_pos++] = 0; // length low byte placeholder
         w->buf[w->byte_pos++] = nal_type & 0x1F;
     }
     w->cache = 0;
@@ -1526,10 +1521,10 @@ VL264_INTERNAL void bs_w_nal_end(bs_writer* w, size_t length_offset) {
     bs_w_flush(w);
     bs_w_align(w);
     bs_w_flush(w);
-    // payload starts at length_offset + 4 (length field) + 1 (nal_type) = length_offset + 5
-    // total NAL content = nal_type + payload = byte_pos - (length_offset + 4)
-    size_t nal_content_len = w->byte_pos - (length_offset + 4);
-    patch_nal_length(w->buf, length_offset, nal_content_len - 1); // -1 because patch_nal_length adds 1
+    size_t nal_content_len = w->byte_pos - (length_offset + NAL_LEN_BYTES);
+    if (nal_content_len > NAL_MAX_SIZE) nal_content_len = NAL_MAX_SIZE;
+    w->buf[length_offset + 0] = (uint8_t)(nal_content_len >> 8);
+    w->buf[length_offset + 1] = (uint8_t)(nal_content_len);
 }
 
 // Top-level encode
@@ -2146,6 +2141,10 @@ vl264_status vl264_decode_next_slice(vl264_dec* d, uint8_t* slice_out, uint32_t*
     d->next_slice++;
 
     return VL264_OK;
+}
+
+vl264_axis vl264_decode_axis(const vl264_dec* d) {
+    return d ? (vl264_axis)d->axis : VL264_AXIS_Z;
 }
 
 // Utilities

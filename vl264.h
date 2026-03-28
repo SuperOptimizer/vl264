@@ -218,6 +218,9 @@ vl264_status vl264_decode_next_slice(
     uint8_t*   slice_out,
     uint32_t*  slice_index);
 
+// Query the encode axis from a streaming decode session (call after decode_begin).
+vl264_axis vl264_decode_axis(const vl264_dec* d);
+
 // ── Utilities ───────────────────────────────────────────────────────────────
 
 const char* vl264_version_str(void);
