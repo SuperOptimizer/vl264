@@ -931,6 +931,152 @@ static void test_edge_cases(void) {
     free(decoded);
 }
 
+// ── Codec property tests ────────────────────────────────────────────────────
+
+static void test_properties(void) {
+    SECTION("properties");
+
+    uint8_t* chunk = (uint8_t*)malloc(VL264_CHUNK_VOXELS);
+    uint8_t* decoded = (uint8_t*)malloc(VL264_CHUNK_VOXELS);
+    gen_ct_phantom(chunk);
+
+    // Property 1: Higher QP = smaller output (monotonic)
+    size_t prev_size = VL264_CHUNK_VOXELS * 2;
+    for (int qp = 5; qp <= 51; qp += 5) {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = VL264_FAST; cfg.qp = qp; cfg.axis = VL264_AXIS_Z; cfg.bit_depth = 8;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        vl264_buf out = {0};
+        vl264_encode(enc, chunk, NULL, NULL, &out);
+        TEST(out.size <= prev_size, "higher QP = smaller output");
+        prev_size = out.size;
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec); vl264_free(out.data);
+    }
+
+    // Property 2: Encode then decode = roundtrip (no crash, reasonable PSNR)
+    for (int qp = 5; qp <= 51; qp += 10) {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = VL264_FAST; cfg.qp = qp; cfg.bit_depth = 8;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        vl264_buf out = {0};
+        vl264_encode(enc, chunk, NULL, NULL, &out);
+        vl264_status s = vl264_decode(dec, out.data, out.size, NULL, NULL, decoded);
+        TEST(s == VL264_OK, "roundtrip succeeds at all QP");
+        float psnr = vl264_psnr(chunk, decoded, VL264_CHUNK_VOXELS);
+        TEST(psnr > 5.0f, "roundtrip PSNR > 5 dB at all QP");
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec); vl264_free(out.data);
+    }
+
+    // Property 3: All three quality presets work
+    vl264_quality quals[] = {VL264_FAST, VL264_DEFAULT, VL264_MAX};
+    for (int q = 0; q < 3; q++) {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = quals[q]; cfg.qp = 20; cfg.bit_depth = 8;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        vl264_buf out = {0};
+        vl264_encode(enc, chunk, NULL, NULL, &out);
+        vl264_decode(dec, out.data, out.size, NULL, NULL, decoded);
+        float psnr = vl264_psnr(chunk, decoded, VL264_CHUNK_VOXELS);
+        TEST(psnr > 10.0f, "quality preset works");
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec); vl264_free(out.data);
+    }
+
+    // Property 4: Bit-depth detection works for 5-bit data
+    uint8_t* chunk5 = (uint8_t*)malloc(VL264_CHUNK_VOXELS);
+    for (size_t i = 0; i < VL264_CHUNK_VOXELS; i++) chunk5[i] = (chunk[i] >> 3) << 3;
+    {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = VL264_FAST; cfg.qp = 20;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        vl264_buf out5 = {0}, out8 = {0};
+        vl264_encode(enc, chunk5, NULL, NULL, &out5);
+        vl264_enc_destroy(enc);
+        // Same data but forced 8-bit
+        cfg.bit_depth = 8;
+        enc = vl264_enc_create(&cfg);
+        vl264_encode(enc, chunk5, NULL, NULL, &out8);
+        printf("    5-bit data: auto=%zu bytes, forced8=%zu bytes\n", out5.size, out8.size);
+        TEST(out5.size < out8.size, "5-bit auto-detect compresses better than forced 8-bit");
+        vl264_free(out5.data); vl264_free(out8.data);
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec);
+    }
+    free(chunk5);
+
+    // Property 5: Encoder reuse (encode multiple chunks with same encoder)
+    {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = VL264_FAST; cfg.qp = 20; cfg.bit_depth = 8;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        for (int i = 0; i < 5; i++) {
+            memset(chunk, (uint8_t)(50 + i * 30), VL264_CHUNK_VOXELS);
+            vl264_buf out = {0};
+            vl264_encode(enc, chunk, NULL, NULL, &out);
+            vl264_status s = vl264_decode(dec, out.data, out.size, NULL, NULL, decoded);
+            TEST(s == VL264_OK, "encoder reuse works");
+            vl264_free(out.data);
+        }
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec);
+    }
+
+    // Property 6: Different axes produce valid output
+    gen_ct_phantom(chunk);
+    for (int ax = 0; ax < 3; ax++) {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = VL264_FAST; cfg.qp = 25; cfg.axis = (vl264_axis)ax; cfg.bit_depth = 8;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        vl264_buf out = {0};
+        vl264_encode(enc, chunk, NULL, NULL, &out);
+        vl264_decode(dec, out.data, out.size, NULL, NULL, decoded);
+        float psnr = vl264_psnr(chunk, decoded, VL264_CHUNK_VOXELS);
+        TEST(psnr > 10.0f, "each axis produces valid output");
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec); vl264_free(out.data);
+    }
+
+    // Property 7: iframe_interval is respected
+    {
+        vl264_cfg cfg = vl264_default_cfg();
+        cfg.quality = VL264_FAST; cfg.qp = 25; cfg.iframe_interval = 8; cfg.bit_depth = 8;
+        vl264_enc* enc = vl264_enc_create(&cfg);
+        vl264_dec* dec = vl264_dec_create();
+        vl264_buf out = {0};
+        vl264_encode(enc, chunk, NULL, NULL, &out);
+        vl264_enc_stats stats;
+        vl264_enc_stats_get(enc, &stats);
+        // With interval=8, expect 128/8=16 I-slices
+        printf("    iframe_interval=8: I=%u P=%u\n", stats.i_slices, stats.p_slices);
+        TEST(stats.i_slices >= 14 && stats.i_slices <= 18, "iframe interval roughly respected");
+        vl264_decode(dec, out.data, out.size, NULL, NULL, decoded);
+        float psnr = vl264_psnr(chunk, decoded, VL264_CHUNK_VOXELS);
+        TEST(psnr > 10.0f, "iframe interval doesn't break decode");
+        vl264_enc_destroy(enc); vl264_dec_destroy(dec); vl264_free(out.data);
+    }
+
+    // Property 8: Compression ratio > 1 for all tested data at QP >= 15
+    {
+        uint8_t* patterns[] = {chunk, NULL};
+        void (*gens[])(uint8_t*) = {gen_ct_phantom, gen_sphere, gen_gradient_z, NULL};
+        for (int g = 0; gens[g]; g++) {
+            gens[g](chunk);
+            vl264_cfg cfg = vl264_default_cfg();
+            cfg.quality = VL264_FAST; cfg.qp = 25; cfg.bit_depth = 8;
+            vl264_enc* enc = vl264_enc_create(&cfg);
+            vl264_buf out = {0};
+            vl264_encode(enc, chunk, NULL, NULL, &out);
+            TEST(out.size < VL264_CHUNK_VOXELS, "compresses at QP=25");
+            vl264_enc_destroy(enc); vl264_free(out.data);
+        }
+    }
+
+    free(chunk);
+    free(decoded);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -966,6 +1112,8 @@ int main(int argc, char** argv) {
         test_streaming();
     if (run_all || has_flag(argc, argv, "--edge"))
         test_edge_cases();
+    if (run_all || has_flag(argc, argv, "--props"))
+        test_properties();
     if (run_all || has_flag(argc, argv, "--bench"))
         test_bench();
 
