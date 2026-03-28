@@ -19,3 +19,4 @@ testdata/
 *.pdb
 *.idb
 coverage-report/
+perf.data
