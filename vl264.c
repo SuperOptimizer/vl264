@@ -1287,9 +1287,6 @@ struct vl264_enc {
     int16_t nc_map[BSTRIDE * BSTRIDE]; // nC per block for current slice
 
     uint32_t slice_order[DIM];
-
-    uint8_t* bs_buf;
-    size_t   bs_cap;
 };
 
 // Block encode state — holds results of prediction + transform + quant
@@ -1548,8 +1545,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
     else
         axis = (int32_t)e->cfg.axis;
 
-    // 2. Classify chunk, adjust QP
-    chunk_class cls = classify_chunk(input);
+    // 2. Set QP (user's QP respected directly)
     int32_t qp_base = e->cfg.qp;
     if (qp_base == 0) {
         switch (e->cfg.quality) {
@@ -1558,9 +1554,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
         case VL264_MAX:     qp_base = 18; break;
         }
     }
-    // Note: chunk classification available for stats but no longer adjusts QP.
-    // The user's QP is respected directly for predictable quality.
-    (void)cls;
+    // chunk classification removed — user's QP is respected directly
     e->resolved_qp = qp_base;
 
     // 3. Generate slice ordering
@@ -1570,7 +1564,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
         raster_order_128(e->slice_order);
 
     // 4. LOD delta: upsample coarse
-    bool use_lod = e->cfg.lod_delta && lod && lod->data && lod->dim > 0;
+    bool use_lod = e->cfg.lod_delta && lod && lod->data && lod->dim > 0 && lod->dim <= DIM;
     if (use_lod) {
         if (!e->lod_upsampled) {
             e->lod_upsampled = (int16_t*)aligned_alloc(VL264_ALIGN,
@@ -1593,9 +1587,11 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
 
     // 6. Write SPS NAL
     size_t sps_off = bs_w_nal_begin(&w, NAL_SPS);
+    // Axis must be resolved by now (never AUTO)
+    if (axis < 0 || axis > 2) return VL264_ERR_INVALID;
     vl264_sps_data sps = {
         .axis = (uint8_t)axis,
-        .qp_base = (uint8_t)qp_base,
+        .qp_base = (uint8_t)VL264_CLAMP(qp_base, 0, 51),
         .morton = e->cfg.morton_order ? 1 : 0,
         .has_boundary = (neighbors != NULL) && e->cfg.boundary_pred ? 1 : 0,
         .has_lod = use_lod ? 1 : 0,
@@ -1811,6 +1807,8 @@ VL264_INTERNAL void decode_slice_blocks(vl264_dec* d, bs_reader* r,
 
     while (block_idx < total_blocks) {
         uint32_t skip_run = bs_r_ue(r);
+        if (skip_run > (uint32_t)(total_blocks - block_idx))
+            skip_run = (uint32_t)(total_blocks - block_idx);
         // Skip `skip_run` blocks (prediction already in recon)
         for (uint32_t s = 0; s < skip_run && block_idx < total_blocks; s++, block_idx++) {
             int32_t bx = block_idx % BSTRIDE;
@@ -2006,7 +2004,6 @@ vl264_enc* vl264_enc_create(const vl264_cfg* cfg) {
 void vl264_enc_destroy(vl264_enc* e) {
     if (!e) return;
     free(e->lod_upsampled);
-    free(e->bs_buf);
     free(e);
 }
 
@@ -2014,6 +2011,11 @@ vl264_status vl264_encode(vl264_enc* e, const uint8_t* chunk,
                            const vl264_neighbors* neighbors,
                            const vl264_lod_ref* lod, vl264_buf* out) {
     if (!e || !chunk || !out) return VL264_ERR_NULL_ARG;
+    // Validate output buffer: if pre-allocated, must be large enough
+    if (out->data && out->capacity < vl264_max_compressed_size())
+        return VL264_ERR_OVERFLOW;
+    // Validate QP
+    if (e->cfg.qp < 0 || e->cfg.qp > 51) return VL264_ERR_INVALID;
     return encode_chunk_impl(e, chunk, neighbors, lod, out);
 }
 
@@ -2042,7 +2044,7 @@ void vl264_dec_destroy(vl264_dec* d) {
 vl264_status vl264_decode(vl264_dec* d, const uint8_t* bitstream, size_t bitstream_size,
                            const vl264_neighbors* neighbors, const vl264_lod_ref* lod,
                            uint8_t* chunk_out) {
-    if (!d || !bitstream || !chunk_out) return VL264_ERR_NULL_ARG;
+    if (!d || !bitstream || !chunk_out || bitstream_size == 0) return VL264_ERR_NULL_ARG;
     return decode_chunk_impl(d, bitstream, bitstream_size, neighbors, lod, chunk_out);
 }
 
