@@ -1689,7 +1689,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
             switch (e->cfg.quality) {
             case VL264_MAX:     iframe_interval = 16; break;
             case VL264_DEFAULT: iframe_interval = 32; break;
-            default:            iframe_interval = 64; break;
+            default:            iframe_interval = 32; break; // was 64, reduced for better max error
             }
         }
         bool is_iframe = should_force_iframe(e->slice_order, ci, iframe_interval);
