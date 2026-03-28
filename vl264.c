@@ -686,8 +686,9 @@ VL264_INTERNAL VL264_HOT void get_block(const int16_t* slice, int32_t px, int32_
     }
 }
 
-// Integer-pel exhaustive search
-VL264_INTERNAL vl264_mv me_search_int(const int16_t orig[16], const int16_t* ref,
+// Diamond search with early termination. Much faster than exhaustive ±3.
+// Pattern: check center → 4 diamond → 4 diagonal → refine best direction
+VL264_INTERNAL vl264_mv me_search_int(const int16_t orig[static 16], const int16_t* ref,
                                        int32_t bx, int32_t by, int32_t range,
                                        int32_t* best_sad) {
     int32_t px = bx * 4, py = by * 4;
@@ -695,16 +696,33 @@ VL264_INTERNAL vl264_mv me_search_int(const int16_t orig[16], const int16_t* ref
     *best_sad = INT32_MAX;
     int16_t blk[16];
 
-    for (int dy = -range; dy <= range; dy++) {
-        for (int dx = -range; dx <= range; dx++) {
+    // Check center (zero MV) first
+    get_block(ref, px, py, blk);
+    *best_sad = sad_4x4(orig, blk);
+    if (*best_sad == 0) return best; // perfect match
+
+    // Diamond search: expanding rings
+    static const int8_t diamond[][2] = {
+        {-1,0},{1,0},{0,-1},{0,1},  // cross
+        {-1,-1},{1,-1},{-1,1},{1,1} // diagonal
+    };
+
+    for (int step = 1; step <= range; step++) {
+        bool improved = false;
+        for (int d = 0; d < 8; d++) {
+            int32_t dx = diamond[d][0] * step;
+            int32_t dy = diamond[d][1] * step;
             get_block(ref, px + dx, py + dy, blk);
             int32_t cost = sad_4x4(orig, blk);
             if (cost < *best_sad) {
                 *best_sad = cost;
-                best.x = (int16_t)(dx * 4); // store in qpel units
+                best.x = (int16_t)(dx * 4);
                 best.y = (int16_t)(dy * 4);
+                improved = true;
+                if (cost == 0) return best; // perfect
             }
         }
+        if (!improved) break; // no improvement at this radius, stop expanding
     }
     return best;
 }
