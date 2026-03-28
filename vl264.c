@@ -1203,6 +1203,7 @@ struct vl264_enc {
     vl264_cfg        cfg;
     vl264_enc_stats  stats;
     int32_t          resolved_qp;
+    int32_t          bit_shift; // current encode bit shift
 
     VL264_ALIGNED(64) int16_t cur_slice[DIM * DIM];
     VL264_ALIGNED(64) int16_t ref_slice[DIM * DIM];
@@ -1336,7 +1337,14 @@ VL264_INTERNAL VL264_HOT VL264_FLATTEN int32_t try_encode_block(vl264_enc* e, bl
         }
     }
 
-    // Reconstruct
+    // Reconstruct — skip dequant/IDCT if all coefficients are zero
+    if (bs->total_coeff == 0) {
+        for (int dy = 0; dy < 4; dy++)
+            for (int dx = 0; dx < 4; dx++)
+                recon_slice[(by*4+dy)*DIM + bx*4+dx] = (int16_t)VL264_CLAMP(bs->pred[dy*4+dx], 0, 255);
+        return 0;
+    }
+
     int16_t dq[16], recon_res[16];
     memcpy(dq, bs->coeff, sizeof(dq));
     dequant4x4(dq, qp);
@@ -1602,6 +1610,7 @@ VL264_INTERNAL vl264_status encode_chunk_impl(vl264_enc* e,
     }
     // chunk classification removed — user's QP is respected directly
     e->resolved_qp = qp_base;
+    e->bit_shift = bit_shift;
 
     // 3. Generate slice ordering
     if (e->cfg.morton_order)
