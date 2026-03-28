@@ -644,12 +644,12 @@ VL264_INTERNAL void intra_pred_4x4(int16_t pred[static 16], int32_t mode,
 }
 
 // SAD for 4x4 — branchless abs via arithmetic
+// SAD — written to enable NEON/AVX auto-vectorization
 VL264_INTERNAL VL264_HOT VL264_PURE int32_t sad_4x4(const int16_t a[static 16], const int16_t b[static 16]) {
     int32_t sum = 0;
-    for (int i = 0; i < 16; i++) {
-        int32_t d = (int32_t)a[i] - (int32_t)b[i];
-        sum += (d ^ (d >> 31)) - (d >> 31); // branchless abs
-    }
+    // abs() is recognized by Clang/GCC and lowered to SABD (NEON) or PABSW (SSE)
+    for (int i = 0; i < 16; i++)
+        sum += abs((int32_t)a[i] - (int32_t)b[i]);
     return sum;
 }
 
