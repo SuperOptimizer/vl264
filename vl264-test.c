@@ -545,7 +545,7 @@ static void test_sweep(void) {
     int qps[] = {5, 10, 15, 20, 25, 30, 35};
     int nqp = 7;
     float prev_psnr = 999.0f;
-    size_t prev_size = VL264_CHUNK_VOXELS * 2;
+    (void)prev_psnr; // used in assertion below
 
     printf("    %-4s  %8s  %6s  %6s  %6s  %6s  %6s\n",
            "QP", "Size", "Ratio", "PSNR", "MAE", "P90", "P99");
@@ -580,7 +580,6 @@ static void test_sweep(void) {
         TEST(stats.ratio > 1.0f, "compression ratio > 1:1 at all tested QPs");
 
         prev_psnr = stats.psnr;
-        prev_size = out.size;
 
         vl264_free(out.data);
         vl264_enc_destroy(enc);
@@ -1059,7 +1058,6 @@ static void test_properties(void) {
 
     // Property 8: Compression ratio > 1 for all tested data at QP >= 15
     {
-        uint8_t* patterns[] = {chunk, NULL};
         void (*gens[])(uint8_t*) = {gen_ct_phantom, gen_sphere, gen_gradient_z, NULL};
         for (int g = 0; gens[g]; g++) {
             gens[g](chunk);

@@ -148,9 +148,6 @@ VL264_INTERNAL void bs_w_flush(bs_writer* w) {
     }
 }
 
-VL264_INTERNAL size_t bs_w_bytes(const bs_writer* w) {
-    return w->byte_pos + (32 - w->bits_left + 7) / 8;
-}
 
 // Reader
 typedef struct {
@@ -219,49 +216,9 @@ VL264_INTERNAL void bs_r_align(bs_reader* r) {
     }
 }
 
-VL264_INTERNAL bool bs_r_eof(const bs_reader* r) {
-    return r->byte_pos >= r->size && r->bits_left <= 0;
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Section 3: RBSP emulation prevention
-// ═════════════════════════════════════════════════════════════════════════════
-
-// Insert 0x03 emulation prevention bytes: 00 00 {00,01,02,03} -> 00 00 03 {..}
-VL264_INTERNAL size_t rbsp_to_nal(const uint8_t* rbsp, size_t len,
-                                   uint8_t* nal, size_t cap) {
-    size_t out = 0;
-    int zeros = 0;
-    for (size_t i = 0; i < len && out < cap; i++) {
-        if (zeros == 2 && rbsp[i] <= 3) {
-            if (out < cap) nal[out++] = 0x03;
-            zeros = 0;
-        }
-        if (out < cap) nal[out++] = rbsp[i];
-        if (rbsp[i] == 0) zeros++;
-        else zeros = 0;
-    }
-    return out;
-}
-
-// Remove emulation prevention bytes
-VL264_INTERNAL size_t nal_to_rbsp(const uint8_t* nal, size_t len,
-                                   uint8_t* rbsp, size_t cap) {
-    size_t out = 0;
-    int zeros = 0;
-    for (size_t i = 0; i < len && out < cap; i++) {
-        if (zeros == 2 && nal[i] == 0x03) {
-            zeros = 0;
-            continue;
-        }
-        if (out < cap) rbsp[out++] = nal[i];
-        if (nal[i] == 0) zeros++;
-        else zeros = 0;
-    }
-    return out;
-}
-
-// ── Length-prefixed NAL framing ──────────────────────────────────────────────
+// Section 3: NAL framing (length-prefixed) ──────────────────────────────────────────────
 // 2-byte big-endian length prefix (max 65535 bytes per NAL).
 // Format: [2-byte length][1-byte nal_type][payload...]
 
@@ -424,35 +381,6 @@ VL264_INTERNAL void dct4x4_inv(const int16_t in[16], int16_t out[16]) {
     }
 }
 
-// Hadamard 4x4 (for DC coefficients)
-VL264_INTERNAL void hadamard4x4_fwd(const int16_t in[16], int16_t out[16]) {
-    int16_t tmp[16];
-    for (int i = 0; i < 4; i++) {
-        int a = in[i*4+0] + in[i*4+3];
-        int b = in[i*4+1] + in[i*4+2];
-        int c = in[i*4+1] - in[i*4+2];
-        int d = in[i*4+0] - in[i*4+3];
-        tmp[i*4+0] = (int16_t)(a + b);
-        tmp[i*4+1] = (int16_t)(c + d);
-        tmp[i*4+2] = (int16_t)(a - b);
-        tmp[i*4+3] = (int16_t)(d - c);
-    }
-    for (int j = 0; j < 4; j++) {
-        int a = tmp[0*4+j] + tmp[3*4+j];
-        int b = tmp[1*4+j] + tmp[2*4+j];
-        int c = tmp[1*4+j] - tmp[2*4+j];
-        int d = tmp[0*4+j] - tmp[3*4+j];
-        out[0*4+j] = (int16_t)((a + b) >> 1);
-        out[1*4+j] = (int16_t)((c + d) >> 1);
-        out[2*4+j] = (int16_t)((a - b) >> 1);
-        out[3*4+j] = (int16_t)((d - c) >> 1);
-    }
-}
-
-VL264_INTERNAL void hadamard4x4_inv(const int16_t in[16], int16_t out[16]) {
-    // Hadamard is its own inverse (up to scaling)
-    hadamard4x4_fwd(in, out);
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 6: Quantization
@@ -522,27 +450,6 @@ VL264_INTERNAL void dequant4x4(int16_t coeff[16], int32_t qp) {
     }
 }
 
-// 3D-aware adaptive QP offset based on local variance
-VL264_INTERNAL int32_t adaptive_qp_offset(const int16_t* slice, int32_t bx, int32_t by,
-                                            float sensitivity) {
-    // Compute variance of a 4x4 block
-    int32_t sum = 0, sum2 = 0;
-    for (int dy = 0; dy < 4; dy++) {
-        for (int dx = 0; dx < 4; dx++) {
-            int32_t v = slice[(by * 4 + dy) * DIM + bx * 4 + dx];
-            sum += v;
-            sum2 += v * v;
-        }
-    }
-    float mean = (float)sum / 16.0f;
-    float var = (float)sum2 / 16.0f - mean * mean;
-    if (var < 1.0f) var = 1.0f;
-
-    // Low variance -> positive QP delta (more compression)
-    // High variance -> negative QP delta (preserve detail)
-    float offset = sensitivity * (4.0f - log2f(var));
-    return VL264_CLAMP((int32_t)offset, -12, 12);
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 7: Intra prediction
@@ -711,16 +618,6 @@ VL264_INTERNAL void intra_pred_4x4(int16_t pred[16], int32_t mode,
     }
 }
 
-// SATD (Sum of Absolute Transformed Differences) for a 4x4 block
-VL264_INTERNAL int32_t satd_4x4(const int16_t a[16], const int16_t b[16]) {
-    int16_t diff[16], tmp[16];
-    for (int i = 0; i < 16; i++) diff[i] = (int16_t)(a[i] - b[i]);
-    dct4x4_fwd(diff, tmp);
-    int32_t sum = 0;
-    for (int i = 0; i < 16; i++) sum += abs(tmp[i]);
-    return sum;
-}
-
 // SAD for 4x4
 VL264_INTERNAL int32_t sad_4x4(const int16_t a[16], const int16_t b[16]) {
     int32_t sum = 0;
@@ -730,56 +627,7 @@ VL264_INTERNAL int32_t sad_4x4(const int16_t a[16], const int16_t b[16]) {
 
 // Intra mode decision with restricted fast-path
 // Returns best mode. Writes predicted block to pred_out.
-VL264_INTERNAL int32_t intra_mode_select(const int16_t orig[16], const int16_t* recon,
-                                          int32_t bx, int32_t by, int16_t pred_out[16],
-                                          int32_t quality) {
-    int16_t top[4], left[4], tl;
-    get_neighbors(recon, bx, by, top, left, &tl);
 
-    int16_t pred[16];
-    int32_t best_cost = INT32_MAX;
-    int32_t best_mode = INTRA_DC;
-
-    // Always try DC first
-    intra_pred_4x4(pred, INTRA_DC, top, left, tl);
-    int32_t cost = satd_4x4(orig, pred);
-    if (cost < best_cost) {
-        best_cost = cost;
-        best_mode = INTRA_DC;
-        memcpy(pred_out, pred, sizeof(pred));
-    }
-
-    // Fast path: if DC is good enough, stop (for VL264_FAST)
-    if (quality == VL264_FAST && best_cost < 64) return best_mode;
-
-    // Try horizontal and vertical
-    int modes_to_try[] = {INTRA_VERT, INTRA_HORIZ};
-    for (int m = 0; m < 2; m++) {
-        intra_pred_4x4(pred, modes_to_try[m], top, left, tl);
-        cost = satd_4x4(orig, pred);
-        if (cost < best_cost) {
-            best_cost = cost;
-            best_mode = modes_to_try[m];
-            memcpy(pred_out, pred, sizeof(pred));
-        }
-    }
-
-    // Restricted: stop if cost is low enough (for VL264_DEFAULT)
-    if (quality <= VL264_DEFAULT && best_cost < 128) return best_mode;
-
-    // Try all remaining directional modes (for VL264_MAX or high residual)
-    for (int m = INTRA_DDL; m < INTRA_NUM_MODES; m++) {
-        intra_pred_4x4(pred, m, top, left, tl);
-        cost = satd_4x4(orig, pred);
-        if (cost < best_cost) {
-            best_cost = cost;
-            best_mode = m;
-            memcpy(pred_out, pred, sizeof(pred));
-        }
-    }
-
-    return best_mode;
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 8: Inter prediction / Motion estimation
@@ -1255,63 +1103,15 @@ VL264_INTERNAL void lod_extract_slice(const int16_t* upsampled,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Section 16: Rate allocation / chunk classification
 // ═════════════════════════════════════════════════════════════════════════════
-
-typedef enum { CHUNK_AIR, CHUNK_MIXED, CHUNK_DENSE } chunk_class;
-
-VL264_INTERNAL chunk_class classify_chunk(const uint8_t* data) {
-    // Subsample: check every 64th voxel (~32K samples)
-    int32_t low = 0, samples = 0;
-    int32_t threshold = 10;
-    for (size_t i = 0; i < VL264_CHUNK_VOXELS; i += 64) {
-        if (data[i] < threshold) low++;
-        samples++;
-    }
-    float frac = (float)low / (float)samples;
-    if (frac > 0.9f) return CHUNK_AIR;
-    if (frac > 0.3f) return CHUNK_MIXED;
-    return CHUNK_DENSE;
-}
-
-VL264_INTERNAL int32_t adjust_qp_for_class(int32_t base_qp, chunk_class cls) {
-    switch (cls) {
-    case CHUNK_AIR:   return VL264_MIN(base_qp + 10, 51);
-    case CHUNK_MIXED: return VL264_MIN(base_qp + 4, 51);
-    case CHUNK_DENSE: return base_qp;
-    }
-    return base_qp;
-}
-
+// Section 16: Helpers
 // ═════════════════════════════════════════════════════════════════════════════
-// Section 17: SIMD-friendly helpers
-// ═════════════════════════════════════════════════════════════════════════════
-
-VL264_INTERNAL void widen_u8_i16(int16_t* VL264_RESTRICT dst,
-                                  const uint8_t* VL264_RESTRICT src, int32_t n) {
-    for (int32_t i = 0; i < n; i++) dst[i] = (int16_t)src[i];
-}
 
 VL264_INTERNAL void clamp_i16_u8(uint8_t* VL264_RESTRICT dst,
                                   const int16_t* VL264_RESTRICT src, int32_t n) {
     for (int32_t i = 0; i < n; i++) {
         dst[i] = (uint8_t)VL264_CLAMP(src[i], 0, 255);
     }
-}
-
-VL264_INTERNAL uint32_t variance_block(const int16_t* slice, int32_t px, int32_t py,
-                                        int32_t bw, int32_t bh) {
-    int32_t sum = 0, sum2 = 0;
-    int32_t count = bw * bh;
-    for (int32_t dy = 0; dy < bh; dy++) {
-        for (int32_t dx = 0; dx < bw; dx++) {
-            int32_t v = slice[VL264_CLAMP(py+dy, 0, DIM-1) * DIM + VL264_CLAMP(px+dx, 0, DIM-1)];
-            sum += v;
-            sum2 += v * v;
-        }
-    }
-    int32_t mean = sum / count;
-    return (uint32_t)(sum2 / count - mean * mean);
 }
 
 // Detect effective bit depth by finding GCD of a sample of non-zero values.
@@ -1338,25 +1138,6 @@ VL264_INTERNAL int32_t detect_bit_shift(const uint8_t* data) {
 
 // 3x3 box filter for reference frame smoothing.
 // Reduces noise in the prediction reference, making residuals smaller.
-VL264_INTERNAL void smooth_slice(const int16_t* VL264_RESTRICT in,
-                                  int16_t* VL264_RESTRICT out) {
-    for (int32_t y = 0; y < DIM; y++) {
-        for (int32_t x = 0; x < DIM; x++) {
-            int32_t sum = 0, count = 0;
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    int32_t ny = y + dy, nx = x + dx;
-                    if (ny >= 0 && ny < DIM && nx >= 0 && nx < DIM) {
-                        sum += in[ny * DIM + nx];
-                        count++;
-                    }
-                }
-            }
-            out[y * DIM + x] = (int16_t)(sum / count);
-        }
-    }
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 18: Encoder state + core
 // ═════════════════════════════════════════════════════════════════════════════
